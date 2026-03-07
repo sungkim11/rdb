@@ -53,7 +53,7 @@ struct MouseRegions {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum OpenMenu {
     File,
-    View,
+    Sql,
     Tools,
     Help,
 }
@@ -76,7 +76,7 @@ impl OpenMenu {
     pub fn items(self) -> &'static [MenuEntry] {
         match self {
             OpenMenu::File => &FILE_MENU,
-            OpenMenu::View => &VIEW_MENU,
+            OpenMenu::Sql => &SQL_MENU,
             OpenMenu::Tools => &TOOLS_MENU,
             OpenMenu::Help => &HELP_MENU,
         }
@@ -90,11 +90,13 @@ static FILE_MENU: [MenuEntry; 4] = [
     entry("Quit", "Ctrl+Q"),
 ];
 
-static VIEW_MENU: [MenuEntry; 0] = [];
+static SQL_MENU: [MenuEntry; 2] = [
+    entry("Open SQL Pane", "Ctrl+D"),
+    entry("Run Query", "Ctrl+Enter"),
+];
 
-static TOOLS_MENU: [MenuEntry; 6] = [
+static TOOLS_MENU: [MenuEntry; 5] = [
     entry("Search", "/"),
-    entry("SQL Query", "Ctrl+D"),
     sep(),
     entry("Refresh", "r"),
     sep(),
@@ -227,14 +229,20 @@ pub enum ImportField {
     Target,
 }
 
-pub struct SqlPopup {
-    pub input: String,
-    pub cursor: usize,
+pub struct SqlState {
+    pub lines: Vec<String>,
+    pub cursor_row: usize,
+    pub cursor_col: usize,
     pub result: Option<SqlResult>,
     pub error: Option<String>,
     pub result_scroll: usize,
     pub col_offset: usize,
-    pub rect: Option<(u16, u16, u16, u16)>,
+}
+
+impl SqlState {
+    pub fn query_text(&self) -> String {
+        self.lines.join(" ")
+    }
 }
 
 #[derive(Clone)]
@@ -359,7 +367,7 @@ pub struct App {
     pub search_state: Option<SearchState>,
     pub export_popup: Option<ExportPopup>,
     pub import_popup: Option<ImportPopup>,
-    pub sql_popup: Option<SqlPopup>,
+    pub sql_state: Option<SqlState>,
     pub info_popup: Option<InfoPopup>,
     pub progress_popup: Option<ProgressPopup>,
     palette_item_regions: Vec<Rect>,
@@ -405,7 +413,7 @@ impl App {
             search_state: None,
             export_popup: None,
             import_popup: None,
-            sql_popup: None,
+            sql_state: None,
             info_popup: None,
             progress_popup: None,
             palette_item_regions: Vec::new(),
@@ -743,7 +751,7 @@ impl App {
                 },
             ),
             (
-                OpenMenu::View,
+                OpenMenu::Sql,
                 Rect {
                     x: view.0,
                     y: view.1,
@@ -827,8 +835,8 @@ impl App {
             KeyCode::Left => {
                 let next = match menu {
                     OpenMenu::File => OpenMenu::Help,
-                    OpenMenu::View => OpenMenu::File,
-                    OpenMenu::Tools => OpenMenu::View,
+                    OpenMenu::Sql => OpenMenu::File,
+                    OpenMenu::Tools => OpenMenu::Sql,
                     OpenMenu::Help => OpenMenu::Tools,
                 };
                 self.open_menu = Some(next);
@@ -836,8 +844,8 @@ impl App {
             }
             KeyCode::Right => {
                 let next = match menu {
-                    OpenMenu::File => OpenMenu::View,
-                    OpenMenu::View => OpenMenu::Tools,
+                    OpenMenu::File => OpenMenu::Sql,
+                    OpenMenu::Sql => OpenMenu::Tools,
                     OpenMenu::Tools => OpenMenu::Help,
                     OpenMenu::Help => OpenMenu::File,
                 };
@@ -885,7 +893,8 @@ impl App {
             "Metadata" => self.switch_info_tab(InfoTab::Metadata)?,
             "Statistics" => self.switch_info_tab(InfoTab::Statistics)?,
             "Search" => self.open_search(),
-            "SQL Query" => self.open_sql_popup(),
+            "Open SQL Pane" => self.toggle_sql_mode(),
+            "Run Query" => self.run_sql_query(),
             "Palette" => self.open_palette_popup(),
             "Refresh" => self.rescan_files()?,
             "Keybindings" => self.open_keybindings_popup(),
@@ -2339,156 +2348,183 @@ impl App {
     }
 
     // ------------------------------------------------------------------
-    // SQL (DuckDB) popup
+    // SQL (DuckDB) pane
     // ------------------------------------------------------------------
 
-    pub fn open_sql_popup(&mut self) {
-        if self.loaded.is_none() {
-            self.set_status("Load a file first");
+    pub fn toggle_sql_mode(&mut self) {
+        if self.sql_state.is_some() {
+            self.sql_state = None;
+            self.set_status("SQL pane closed");
+        } else {
+            self.sql_state = Some(SqlState {
+                lines: vec!["SELECT * FROM data LIMIT 100".to_string()],
+                cursor_row: 0,
+                cursor_col: 27,
+                result: None,
+                error: None,
+                result_scroll: 0,
+                col_offset: 0,
+            });
+            self.active_pane = ActivePane::Preview;
+            self.set_status("SQL pane opened — Ctrl+Enter to run query");
+        }
+    }
+
+    pub fn run_sql_query(&mut self) {
+        let Some(sql) = &self.sql_state else {
+            self.set_status("Open SQL pane first (Ctrl+D)");
+            return;
+        };
+        let query = sql.query_text();
+        if query.trim().is_empty() {
+            self.set_status("Empty query");
             return;
         }
-        self.sql_popup = Some(SqlPopup {
-            input: "SELECT * FROM data LIMIT 100".to_string(),
-            cursor: 27,
-            result: None,
-            error: None,
-            result_scroll: 0,
-            col_offset: 0,
-            rect: None,
-        });
+        let path = self
+            .loaded
+            .as_ref()
+            .map(|l| l.path.clone())
+            .unwrap_or_default();
+        match run_sql(&path, &query) {
+            Ok(result) => {
+                let msg = if result.capped {
+                    format!("SQL: {} rows (capped at 10,000)", result.row_count)
+                } else {
+                    format!("SQL: {} rows", result.row_count)
+                };
+                if let Some(sql) = self.sql_state.as_mut() {
+                    sql.result = Some(result);
+                    sql.error = None;
+                    sql.result_scroll = 0;
+                    sql.col_offset = 0;
+                }
+                self.set_status(msg);
+            }
+            Err(e) => {
+                if let Some(sql) = self.sql_state.as_mut() {
+                    sql.error = Some(format!("{e:#}"));
+                    sql.result = None;
+                }
+            }
+        }
     }
 
     pub fn handle_sql_key(&mut self, key: KeyEvent) -> anyhow::Result<bool> {
-        let Some(popup) = self.sql_popup.as_mut() else {
+        let Some(sql) = self.sql_state.as_mut() else {
             return Ok(false);
         };
 
+        // Ctrl+Enter: run query
+        if key.code == KeyCode::Enter && key.modifiers.contains(KeyModifiers::CONTROL) {
+            let _ = sql;
+            self.run_sql_query();
+            return Ok(true);
+        }
+
         match key.code {
-            KeyCode::Esc => {
-                self.sql_popup = None;
-                self.set_status("SQL cancelled");
-            }
             KeyCode::Enter => {
-                let query = popup.input.clone();
-                let path = self
-                    .loaded
-                    .as_ref()
-                    .map(|l| l.path.clone())
-                    .unwrap_or_default();
-                match run_sql(&path, &query) {
-                    Ok(result) => {
-                        let msg = if result.capped {
-                            format!("{} rows (capped at 10,000)", result.row_count)
-                        } else {
-                            format!("{} rows", result.row_count)
-                        };
-                        if let Some(popup) = self.sql_popup.as_mut() {
-                            popup.result = Some(result);
-                            popup.error = None;
-                            popup.result_scroll = 0;
-                            popup.col_offset = 0;
-                        }
-                        self.set_status(msg);
-                    }
-                    Err(e) => {
-                        if let Some(popup) = self.sql_popup.as_mut() {
-                            popup.error = Some(format!("{e:#}"));
-                            popup.result = None;
-                        }
-                    }
-                }
-            }
-            KeyCode::Left => {
-                if let Some(popup) = self.sql_popup.as_mut() {
-                    if popup.result.is_some()
-                        && key.modifiers.contains(KeyModifiers::SHIFT)
-                    {
-                        popup.col_offset = popup.col_offset.saturating_sub(1);
-                    } else {
-                        popup.cursor = popup.cursor.saturating_sub(1);
-                    }
-                }
-            }
-            KeyCode::Right => {
-                if let Some(popup) = self.sql_popup.as_mut() {
-                    if popup.result.is_some()
-                        && key.modifiers.contains(KeyModifiers::SHIFT)
-                    {
-                        let max_cols = popup
-                            .result
-                            .as_ref()
-                            .map(|r| r.column_names.len().saturating_sub(1))
-                            .unwrap_or(0);
-                        popup.col_offset = cmp::min(popup.col_offset + 1, max_cols);
-                    } else {
-                        popup.cursor =
-                            cmp::min(popup.cursor + 1, popup.input.chars().count());
-                    }
-                }
+                // Insert new line
+                let row = sql.cursor_row;
+                let col = sql.cursor_col;
+                let current_line = &sql.lines[row];
+                let before: String = current_line.chars().take(col).collect();
+                let after: String = current_line.chars().skip(col).collect();
+                sql.lines[row] = before;
+                sql.lines.insert(row + 1, after);
+                sql.cursor_row += 1;
+                sql.cursor_col = 0;
             }
             KeyCode::Up => {
-                if let Some(popup) = self.sql_popup.as_mut() {
-                    popup.result_scroll = popup.result_scroll.saturating_sub(1);
+                if key.modifiers.contains(KeyModifiers::SHIFT) {
+                    sql.result_scroll = sql.result_scroll.saturating_sub(1);
+                } else if sql.cursor_row > 0 {
+                    sql.cursor_row -= 1;
+                    let line_len = sql.lines[sql.cursor_row].chars().count();
+                    sql.cursor_col = cmp::min(sql.cursor_col, line_len);
                 }
             }
             KeyCode::Down => {
-                if let Some(popup) = self.sql_popup.as_mut() {
-                    if let Some(result) = &popup.result {
+                if key.modifiers.contains(KeyModifiers::SHIFT) {
+                    if let Some(result) = &sql.result {
                         let max = result.rows.len().saturating_sub(1);
-                        popup.result_scroll = cmp::min(popup.result_scroll + 1, max);
+                        sql.result_scroll = cmp::min(sql.result_scroll + 1, max);
                     }
+                } else if sql.cursor_row < sql.lines.len() - 1 {
+                    sql.cursor_row += 1;
+                    let line_len = sql.lines[sql.cursor_row].chars().count();
+                    sql.cursor_col = cmp::min(sql.cursor_col, line_len);
+                }
+            }
+            KeyCode::Left => {
+                if key.modifiers.contains(KeyModifiers::SHIFT) {
+                    sql.col_offset = sql.col_offset.saturating_sub(1);
+                } else if sql.cursor_col > 0 {
+                    sql.cursor_col -= 1;
+                } else if sql.cursor_row > 0 {
+                    sql.cursor_row -= 1;
+                    sql.cursor_col = sql.lines[sql.cursor_row].chars().count();
+                }
+            }
+            KeyCode::Right => {
+                let line_len = sql.lines[sql.cursor_row].chars().count();
+                if key.modifiers.contains(KeyModifiers::SHIFT) {
+                    let max_cols = sql
+                        .result
+                        .as_ref()
+                        .map(|r| r.column_names.len().saturating_sub(1))
+                        .unwrap_or(0);
+                    sql.col_offset = cmp::min(sql.col_offset + 1, max_cols);
+                } else if sql.cursor_col < line_len {
+                    sql.cursor_col += 1;
+                } else if sql.cursor_row < sql.lines.len() - 1 {
+                    sql.cursor_row += 1;
+                    sql.cursor_col = 0;
                 }
             }
             KeyCode::PageUp => {
-                if let Some(popup) = self.sql_popup.as_mut() {
-                    popup.result_scroll = popup.result_scroll.saturating_sub(20);
-                }
+                sql.result_scroll = sql.result_scroll.saturating_sub(20);
             }
             KeyCode::PageDown => {
-                if let Some(popup) = self.sql_popup.as_mut() {
-                    if let Some(result) = &popup.result {
-                        let max = result.rows.len().saturating_sub(1);
-                        popup.result_scroll = cmp::min(popup.result_scroll + 20, max);
-                    }
+                if let Some(result) = &sql.result {
+                    let max = result.rows.len().saturating_sub(1);
+                    sql.result_scroll = cmp::min(sql.result_scroll + 20, max);
                 }
             }
             KeyCode::Home => {
-                if let Some(popup) = self.sql_popup.as_mut() {
-                    popup.cursor = 0;
-                }
+                sql.cursor_col = 0;
             }
             KeyCode::End => {
-                if let Some(popup) = self.sql_popup.as_mut() {
-                    popup.cursor = popup.input.chars().count();
-                }
+                sql.cursor_col = sql.lines[sql.cursor_row].chars().count();
             }
             KeyCode::Backspace => {
-                if let Some(popup) = self.sql_popup.as_mut() {
-                    if popup.cursor > 0 {
-                        let mut chars: Vec<char> = popup.input.chars().collect();
-                        chars.remove(popup.cursor - 1);
-                        popup.input = chars.into_iter().collect();
-                        popup.cursor -= 1;
-                    }
+                if sql.cursor_col > 0 {
+                    let mut chars: Vec<char> = sql.lines[sql.cursor_row].chars().collect();
+                    chars.remove(sql.cursor_col - 1);
+                    sql.lines[sql.cursor_row] = chars.into_iter().collect();
+                    sql.cursor_col -= 1;
+                } else if sql.cursor_row > 0 {
+                    let current = sql.lines.remove(sql.cursor_row);
+                    sql.cursor_row -= 1;
+                    sql.cursor_col = sql.lines[sql.cursor_row].chars().count();
+                    sql.lines[sql.cursor_row].push_str(&current);
                 }
             }
             KeyCode::Delete => {
-                if let Some(popup) = self.sql_popup.as_mut() {
-                    let len = popup.input.chars().count();
-                    if popup.cursor < len {
-                        let mut chars: Vec<char> = popup.input.chars().collect();
-                        chars.remove(popup.cursor);
-                        popup.input = chars.into_iter().collect();
-                    }
+                let line_len = sql.lines[sql.cursor_row].chars().count();
+                if sql.cursor_col < line_len {
+                    let mut chars: Vec<char> = sql.lines[sql.cursor_row].chars().collect();
+                    chars.remove(sql.cursor_col);
+                    sql.lines[sql.cursor_row] = chars.into_iter().collect();
+                } else if sql.cursor_row < sql.lines.len() - 1 {
+                    let next = sql.lines.remove(sql.cursor_row + 1);
+                    sql.lines[sql.cursor_row].push_str(&next);
                 }
             }
             KeyCode::Char(c) => {
-                if let Some(popup) = self.sql_popup.as_mut() {
-                    let mut chars: Vec<char> = popup.input.chars().collect();
-                    chars.insert(popup.cursor, c);
-                    popup.input = chars.into_iter().collect();
-                    popup.cursor += 1;
-                }
+                let mut chars: Vec<char> = sql.lines[sql.cursor_row].chars().collect();
+                chars.insert(sql.cursor_col, c);
+                sql.lines[sql.cursor_row] = chars.into_iter().collect();
+                sql.cursor_col += 1;
             }
             _ => return Ok(false),
         }
@@ -2517,7 +2553,12 @@ impl App {
                 "  o                Sort by current column (asc/desc/none)".to_string(),
                 "  Click header     Sort by clicked column".to_string(),
                 "  /                Search in loaded data".to_string(),
-                "  Ctrl+D           SQL query (DuckDB)".to_string(),
+                String::new(),
+                "SQL (DuckDB)".to_string(),
+                "  Ctrl+D           Toggle SQL pane".to_string(),
+                "  Ctrl+Enter       Run SQL query".to_string(),
+                "  Shift+Up/Down    Scroll results".to_string(),
+                "  Shift+Left/Right Scroll result columns".to_string(),
                 String::new(),
                 "Info Tabs".to_string(),
                 "  1 / click        Schema".to_string(),

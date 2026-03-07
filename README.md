@@ -1,11 +1,11 @@
 # rdb
 
 `rdb` is a terminal data explorer built with Rust + Ratatui + Polars + DuckDB.
-It provides a multi-pane TUI with a file explorer, Parquet/CSV data preview with sorting and search, SQL queries via DuckDB, info tabs (schema, statistics, metadata), import/export, menu bar, and popup-driven workflows.
+It provides a multi-pane TUI with a file explorer, Parquet/CSV data preview with sorting and search, a SQL query pane powered by DuckDB, info tabs (schema, statistics, metadata), import/export, menu bar, and popup-driven workflows.
 
 ## Current Features
 
-- Top menus: `File`, `View`, `Tools`, `Help`
+- Top menus: `File`, `SQL`, `Tools`, `Help`
 - File explorer pane (left):
   - Tree view for directories/files
   - Expand/collapse directories
@@ -16,15 +16,17 @@ It provides a multi-pane TUI with a file explorer, Parquet/CSV data preview with
   - Horizontal column scrolling
   - Column sorting (ascending/descending)
   - Lazy data loading via row/column slicing (Polars)
+- SQL pane (right, replaces preview):
+  - `SQL | Open SQL Pane` or `Ctrl+D` to toggle
+  - Multi-line SQL editor with line numbers
+  - The loaded file is exposed as a `data` table
+  - Results displayed in a scrollable table with column navigation
+  - Powered by DuckDB (in-memory)
 - Info tabs:
   - Schema, Statistics, Metadata tabs below preview
   - Prettified popup views
 - Search:
   - `Tools | Search` popup for searching within loaded data
-- SQL queries:
-  - `Tools | SQL Query` popup for running SQL against loaded data via DuckDB
-  - The loaded file is exposed as a `data` table
-  - Results displayed in a scrollable table with column navigation
 - File operations (via menu):
   - Rename, copy, move
   - Delete (double-press confirm)
@@ -135,7 +137,7 @@ Settings (palette, recent files) are stored in:
 
 Navigation:
 
-- `Tab`: switch pane (Files / Preview)
+- `Tab`: switch pane (Files / Preview or SQL)
 - `Up/Down`: move selection / scroll rows
 - `Left/Right`: collapse/expand dir · scroll columns
 - `Ctrl+Left/Right`: scroll columns by 5
@@ -149,7 +151,13 @@ Data:
 - `o`: sort by current column (asc/desc/none)
 - Click header: sort by clicked column
 - `/`: search in loaded data
-- `Ctrl+D`: SQL query (DuckDB)
+
+SQL (DuckDB):
+
+- `Ctrl+D`: toggle SQL pane
+- `Ctrl+Enter`: run SQL query
+- `Shift+Up/Down`: scroll results
+- `Shift+Left/Right`: scroll result columns
 
 Info tabs:
 
@@ -197,7 +205,7 @@ cargo run -- data/sample.parquet
 Then try:
 
 1. `Tools | Palette`
-2. `Tools | SQL Query` — run `SELECT * FROM data LIMIT 100`
+2. `Ctrl+D` to open SQL pane, then `SELECT count(*) FROM data`
 3. `Tools | Search`
 4. `File | Export to CSV`
 5. `Help | Keybindings`

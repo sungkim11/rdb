@@ -97,12 +97,6 @@ fn run_app(
                     continue;
                 }
 
-                if app.sql_popup.is_some() {
-                    let result = app.handle_sql_key(key);
-                    app.apply_result(result.map(|_| ()));
-                    continue;
-                }
-
                 if app.search_state.is_some() {
                     let result = app.handle_search_key(key);
                     app.apply_result(result.map(|_| ()));
@@ -140,8 +134,18 @@ fn run_app(
                 }
 
                 if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('d') {
-                    app.open_sql_popup();
+                    app.toggle_sql_mode();
                     continue;
+                }
+
+                // SQL pane: when active and preview focused, route keys to SQL handler
+                if app.sql_state.is_some() && app.active_pane == ActivePane::Preview {
+                    // Let Tab through to toggle focus, let Ctrl+Q through to quit
+                    if key.code != KeyCode::Tab {
+                        let result = app.handle_sql_key(key);
+                        app.apply_result(result.map(|_| ()));
+                        continue;
+                    }
                 }
 
                 match key.code {
