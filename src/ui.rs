@@ -9,7 +9,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 
-use crate::app::{ActivePane, App, ImportField, InfoLineKind, InfoTab, LoadedFileType, OpenMenu, SearchMode, SearchScope};
+use crate::app::{ActivePane, App, ImportField, InfoLineKind, InfoTab, LeftTab, LoadedFileType, OpenMenu, SearchMode, SearchScope};
 use crate::theme::PaletteTheme;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
@@ -77,6 +77,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         draw_import_popup(frame, area, app);
     }
 
+    if app.pg_connect_popup.is_some() {
+        draw_pg_connect_popup(frame, area, app);
+    }
+
     if app.info_popup.is_some() {
         draw_info_popup(frame, area, app);
     }
@@ -105,6 +109,10 @@ fn draw_top_bar(frame: &mut Frame, area: Rect, app: &mut App) {
     spans.push(Span::styled("Tools", menu_style(OpenMenu::Tools)));
     spans.push(Span::styled("  ", base));
     spans.push(Span::styled("Help", menu_style(OpenMenu::Help)));
+    if app.pg_conn_str.is_some() {
+        spans.push(Span::styled("  ", base));
+        spans.push(Span::styled("[PG]", active));
+    }
     let width = usize::from(area.width);
     let used = spans
         .iter()
@@ -153,7 +161,7 @@ fn draw_body(frame: &mut Frame, area: Rect, app: &mut App) {
         .constraints([Constraint::Length(36), Constraint::Min(20)])
         .split(inner);
 
-    let files_inner = draw_files_pane(frame, panes[0], app);
+    let files_inner = draw_left_pane(frame, panes[0], app);
     let rows_inner = if app.sql_state.is_some() {
         draw_sql_pane(frame, panes[1], app)
     } else {
@@ -176,6 +184,129 @@ fn draw_body(frame: &mut Frame, area: Rect, app: &mut App) {
             rows_inner.height,
         ),
     );
+}
+
+fn draw_left_pane(frame: &mut Frame, area: Rect, app: &mut App) -> Rect {
+    frame.render_widget(
+        Paragraph::new("").style(Style::default().bg(app.theme.bg)),
+        area,
+    );
+
+    // Split: 1 line for tabs, rest for content
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(3)])
+        .split(area);
+
+    // Draw tab bar
+    let tab_area = sections[0];
+    let base = Style::default().fg(app.theme.bar_fg).bg(app.theme.bar_bg);
+    let active = Style::default()
+        .fg(app.theme.active_fg)
+        .bg(app.theme.active_bg)
+        .add_modifier(Modifier::BOLD);
+    let tab_width = usize::from(tab_area.width);
+
+    let mut spans = Vec::new();
+    let mut tab_regions = Vec::new();
+    let mut cx = tab_area.x;
+    for tab in LeftTab::tabs(app.pg_conn_str.is_some()) {
+        let label = format!(" {} ", tab.label());
+        let style = if app.left_tab == tab { active } else { base };
+        let w = label.len() as u16;
+        tab_regions.push((
+            tab,
+            crate::app::Rect { x: cx, y: tab_area.y, width: w, height: 1 },
+        ));
+        spans.push(Span::styled(label, style));
+        spans.push(Span::styled(" ", base));
+        cx += w + 1;
+    }
+    let used: usize = spans.iter().map(|s| s.content.len()).sum();
+    if used < tab_width {
+        spans.push(Span::styled(" ".repeat(tab_width - used), base));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), tab_area);
+    app.left_tab_regions = tab_regions;
+
+    // Draw content based on active tab
+    match app.left_tab {
+        LeftTab::Files => draw_files_pane(frame, sections[1], app),
+        LeftTab::Connections => {
+            draw_connections_list(frame, sections[1], app)
+        }
+        LeftTab::Postgres => {
+            draw_pg_tree_pane(frame, sections[1], app)
+        }
+    }
+}
+
+fn draw_connections_list(frame: &mut Frame, area: Rect, app: &mut App) -> Rect {
+    let focused = app.active_pane == ActivePane::Files;
+    let title = if focused {
+        " Saved Connections [focused] "
+    } else {
+        " Saved Connections "
+    };
+
+    frame.render_widget(
+        Paragraph::new("").style(Style::default().bg(app.theme.bg)),
+        area,
+    );
+    let block = Block::default()
+        .title(title)
+        .title_style(Style::default().fg(app.theme.fg).bg(app.theme.bg))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(app.theme.panel_border).bg(app.theme.bg));
+    frame.render_widget(block.clone(), area);
+    let inner = block.inner(area);
+
+    let visible_rows = usize::from(inner.height);
+    app.conn_ensure_visible(visible_rows);
+
+    let start = app.conn_scroll;
+    let end = cmp::min(start + visible_rows, app.saved_connections.len());
+
+    let mut items = Vec::new();
+    for idx in start..end {
+        let conn = &app.saved_connections[idx];
+        let label = format!(" {}", conn.display_label());
+        let style = Style::default().fg(app.theme.fg).bg(app.theme.bg);
+        items.push(ListItem::new(Line::styled(label, style)));
+    }
+
+    if items.is_empty() {
+        items.push(ListItem::new(Line::styled(
+            " (no saved connections)",
+            Style::default().fg(app.theme.dim_fg).bg(app.theme.bg),
+        )));
+        items.push(ListItem::new(Line::styled(
+            " SQL > Connect to PostgreSQL",
+            Style::default().fg(app.theme.dim_fg).bg(app.theme.bg),
+        )));
+    }
+
+    let active_selected_style = Style::default()
+        .fg(app.theme.active_fg)
+        .bg(app.theme.active_bg)
+        .add_modifier(Modifier::BOLD);
+    let inactive_selected_style = Style::default().fg(app.theme.fg).bg(app.theme.line_bg);
+
+    let list = List::new(items)
+        .style(Style::default().bg(app.theme.bg))
+        .highlight_style(if focused {
+            active_selected_style
+        } else {
+            inactive_selected_style
+        });
+
+    let mut state = ListState::default();
+    if !app.saved_connections.is_empty() {
+        state.select(Some(app.conn_selected.saturating_sub(start)));
+    }
+
+    frame.render_stateful_widget(list, inner, &mut state);
+    inner
 }
 
 fn draw_files_pane(frame: &mut Frame, area: Rect, app: &mut App) -> Rect {
@@ -246,18 +377,90 @@ fn draw_files_pane(frame: &mut Frame, area: Rect, app: &mut App) -> Rect {
     inner
 }
 
+fn draw_pg_tree_pane(frame: &mut Frame, area: Rect, app: &mut App) -> Rect {
+    let focused = app.active_pane == ActivePane::Files;
+    let title = if focused {
+        " Database [focused] "
+    } else {
+        " Database "
+    };
+
+    frame.render_widget(
+        Paragraph::new("").style(Style::default().bg(app.theme.bg)),
+        area,
+    );
+    let block = Block::default()
+        .title(title)
+        .title_style(Style::default().fg(app.theme.fg).bg(app.theme.bg))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(app.theme.panel_border).bg(app.theme.bg));
+    frame.render_widget(block.clone(), area);
+
+    let inner = block.inner(area);
+    let visible_rows = usize::from(inner.height);
+    app.pg_tree_ensure_visible(visible_rows);
+
+    let Some(tree) = &app.pg_tree else {
+        return inner;
+    };
+
+    let start = tree.scroll;
+    let end = cmp::min(start + visible_rows, tree.entries.len());
+
+    let mut items = Vec::new();
+    for idx in start..end {
+        let entry = &tree.entries[idx];
+        let line = format!(" {}", entry.label);
+        let style = if entry.is_schema {
+            Style::default().fg(app.theme.menu_fg).bg(app.theme.bg)
+        } else {
+            Style::default().fg(app.theme.fg).bg(app.theme.bg)
+        };
+        items.push(ListItem::new(Line::styled(line, style)));
+    }
+
+    if items.is_empty() {
+        items.push(ListItem::new(Line::styled(
+            " (no tables)",
+            Style::default().fg(app.theme.dim_fg).bg(app.theme.bg),
+        )));
+    }
+
+    let active_selected_style = Style::default()
+        .fg(app.theme.active_fg)
+        .bg(app.theme.active_bg)
+        .add_modifier(Modifier::BOLD);
+    let inactive_selected_style = Style::default().fg(app.theme.fg).bg(app.theme.line_bg);
+
+    let list = List::new(items)
+        .style(Style::default().bg(app.theme.bg))
+        .highlight_style(if focused {
+            active_selected_style
+        } else {
+            inactive_selected_style
+        });
+
+    let mut state = ListState::default();
+    if !tree.entries.is_empty() {
+        state.select(Some(tree.selected.saturating_sub(start)));
+    }
+
+    frame.render_stateful_widget(list, inner, &mut state);
+    inner
+}
+
 fn draw_preview_pane(frame: &mut Frame, area: Rect, app: &mut App) -> Rect {
-    let is_csv = app
-        .loaded
-        .as_ref()
-        .is_some_and(|l| l.file_type == LoadedFileType::Csv);
+    let file_type = app.loaded.as_ref().map(|l| l.file_type);
+    let type_label = match file_type {
+        Some(LoadedFileType::Csv) => "CSV",
+        Some(LoadedFileType::Postgres) => "Postgres",
+        _ => "Parquet",
+    };
 
     let title = if app.active_pane == ActivePane::Preview {
-        if is_csv { " CSV Preview [focused] " } else { " Parquet Preview [focused] " }
-    } else if is_csv {
-        " CSV Preview "
+        format!(" {type_label} Preview [focused] ")
     } else {
-        " Parquet Preview "
+        format!(" {type_label} Preview ")
     };
 
     // Fill pane area with theme bg
@@ -273,8 +476,8 @@ fn draw_preview_pane(frame: &mut Frame, area: Rect, app: &mut App) -> Rect {
     frame.render_widget(block.clone(), area);
     let inner = block.inner(area);
 
-    let rows_area = if is_csv {
-        // CSV: no info tabs, full area for rows
+    let rows_area = if file_type != Some(LoadedFileType::Parquet) {
+        // CSV/Postgres: no info tabs, full area for rows
         inner
     } else {
         let sections = Layout::default()
@@ -1317,6 +1520,124 @@ fn draw_import_popup(frame: &mut Frame, area: Rect, app: &mut App) {
     frame.render_widget(Paragraph::new(lines), block.inner(rect));
 }
 
+fn draw_pg_connect_popup(frame: &mut Frame, area: Rect, app: &mut App) {
+    use crate::app::{PG_FIELD_COUNT, PG_URI_FIELD};
+
+    if app.pg_connect_popup.is_none() {
+        return;
+    }
+
+    let has_error = app.pg_connect_popup.as_ref().is_some_and(|p| p.error.is_some());
+    // Each field = 1 label + 1 input = 2 lines, + URI label + URI input + separator + error + hint + border
+    let field_lines = (PG_FIELD_COUNT * 2) as u16;
+    let base_height: u16 = field_lines + 1 + 2 + 2 + if has_error { 1 } else { 0 } + 1;
+    //                                     sep  uri  border                            hint
+
+    if area.width < 30 || area.height < base_height {
+        return;
+    }
+
+    let width = cmp::min(64, area.width.saturating_sub(4));
+    let height = base_height;
+    let rect = Rect::new(
+        (area.width.saturating_sub(width)) / 2,
+        (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    );
+
+    if let Some(popup) = app.pg_connect_popup.as_mut() {
+        popup.rect = Some((rect.x, rect.y, rect.width, rect.height));
+    }
+
+    let popup = app.pg_connect_popup.as_ref().unwrap();
+    let inner_width = usize::from(width.saturating_sub(2));
+
+    let label_style = Style::default().fg(app.theme.menu_fg).bg(app.theme.menu_bg);
+    let input_style = Style::default().fg(app.theme.fg).bg(app.theme.line_bg);
+    let inactive_input_style = Style::default().fg(app.theme.dim_fg).bg(app.theme.line_bg);
+    let cursor_style = Style::default()
+        .fg(app.theme.active_fg)
+        .bg(app.theme.active_bg);
+    let hint_style = Style::default().fg(app.theme.dim_fg).bg(app.theme.menu_bg);
+    let error_style = Style::default().fg(app.theme.active_fg).bg(app.theme.menu_bg);
+    let sep_style = Style::default().fg(app.theme.dim_fg).bg(app.theme.menu_bg);
+
+    let mut lines = Vec::new();
+
+    for (i, field) in popup.fields.iter().enumerate() {
+        let is_active = i == popup.active_field;
+        let marker = if is_active { "▶" } else { " " };
+
+        lines.push(Line::styled(
+            clip_or_pad(&format!(" {marker} {}", field.label), inner_width),
+            label_style,
+        ));
+
+        let display_value: String = if field.masked {
+            "*".repeat(field.value.len())
+        } else {
+            field.value.clone()
+        };
+
+        let line = build_input_line(
+            &display_value,
+            field.cursor,
+            inner_width,
+            if is_active { input_style } else { inactive_input_style },
+            if is_active { cursor_style } else { inactive_input_style },
+        );
+        lines.push(line);
+    }
+
+    // Separator
+    lines.push(Line::styled(
+        clip_or_pad(&format!(" {}", "─".repeat(inner_width.saturating_sub(2))), inner_width),
+        sep_style,
+    ));
+
+    // URI field
+    let uri_active = popup.active_field == PG_URI_FIELD;
+    let uri_marker = if uri_active { "▶" } else { " " };
+    lines.push(Line::styled(
+        clip_or_pad(&format!(" {uri_marker} URL"), inner_width),
+        label_style,
+    ));
+
+    let uri_line = build_input_line(
+        &popup.uri,
+        popup.uri_cursor,
+        inner_width,
+        if uri_active { input_style } else { inactive_input_style },
+        if uri_active { cursor_style } else { inactive_input_style },
+    );
+    lines.push(uri_line);
+
+    if let Some(err) = &popup.error {
+        lines.push(Line::styled(
+            clip_or_pad(&format!(" {err}"), inner_width),
+            error_style,
+        ));
+    }
+    lines.push(Line::styled(
+        clip_or_pad(" Enter: connect  Tab/↑↓: switch field  Esc: cancel", inner_width),
+        hint_style,
+    ));
+
+    let block = Block::default()
+        .title(" Connect to PostgreSQL ")
+        .borders(Borders::ALL)
+        .border_style(
+            Style::default()
+                .fg(app.theme.panel_border)
+                .bg(app.theme.menu_bg),
+        );
+
+    frame.render_widget(Clear, rect);
+    frame.render_widget(block.clone(), rect);
+    frame.render_widget(Paragraph::new(lines), block.inner(rect));
+}
+
 fn build_input_line(
     input: &str,
     cursor: usize,
@@ -1531,10 +1852,11 @@ fn draw_progress_popup(frame: &mut Frame, area: Rect, app: &mut App) {
 
 fn draw_sql_pane(frame: &mut Frame, area: Rect, app: &mut App) -> Rect {
     let focused = app.active_pane == ActivePane::Preview;
+    let backend = if app.pg_conn_str.is_some() { "PostgreSQL" } else { "DuckDB" };
     let title = if focused {
-        " SQL (DuckDB) [focused] "
+        format!(" SQL ({backend}) [focused] ")
     } else {
-        " SQL (DuckDB) "
+        format!(" SQL ({backend}) ")
     };
 
     frame.render_widget(
@@ -1568,14 +1890,17 @@ fn draw_sql_editor(frame: &mut Frame, area: Rect, app: &mut App) {
         None => return,
     };
 
-    let file_label = app
-        .loaded
-        .as_ref()
-        .map(|l| format!(" Table: data  ({})", app.display_path(&l.path)))
-        .unwrap_or_else(|| " Table: data  (load a file first)".to_string());
+    let file_label = if app.pg_conn_str.is_some() {
+        " PostgreSQL — query any table directly".to_string()
+    } else {
+        app.loaded
+            .as_ref()
+            .map(|l| format!(" Table: data  ({})", app.display_path(&l.path)))
+            .unwrap_or_else(|| " Table: data  (load a file first)".to_string())
+    };
 
     let editor_block = Block::default()
-        .title(" Query (Ctrl+Enter: run) ")
+        .title(" Query (F5: run) ")
         .title_style(Style::default().fg(app.theme.fg).bg(app.theme.bg))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(app.theme.panel_border).bg(app.theme.bg));
@@ -1760,7 +2085,7 @@ fn draw_sql_results(frame: &mut Frame, area: Rect, app: &mut App) {
         }
     } else {
         lines.push(Line::styled(
-            clip_or_pad(" No results — enter a query and press Ctrl+Enter", inner_width),
+            clip_or_pad(" No results — enter a query and press F5", inner_width),
             label_style,
         ));
     }

@@ -8,6 +8,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::duckdb::{SqlResult, run_sql};
+use crate::postgres as pg;
 use crate::parquet::{
     ColumnStatistics, ParquetFileInfo, ParquetMeta, SearchResults, compute_column_statistics,
     compute_csv_sort_indices, compute_sort_indices, export_csv, fit_visible_columns, import_csv,
@@ -26,11 +27,11 @@ const SETTINGS_FILE: &str = "settings.conf";
 const APP_NAME: &str = "rdb";
 
 #[derive(Clone, Copy)]
-struct Rect {
-    x: u16,
-    y: u16,
-    width: u16,
-    height: u16,
+pub struct Rect {
+    pub x: u16,
+    pub y: u16,
+    pub width: u16,
+    pub height: u16,
 }
 
 impl Rect {
@@ -90,9 +91,12 @@ static FILE_MENU: [MenuEntry; 4] = [
     entry("Quit", "Ctrl+Q"),
 ];
 
-static SQL_MENU: [MenuEntry; 2] = [
+static SQL_MENU: [MenuEntry; 5] = [
     entry("Open SQL Pane", "Ctrl+D"),
-    entry("Run Query", "Ctrl+Enter"),
+    entry("Run Query", "F5"),
+    sep(),
+    entry("Connect to PostgreSQL", ""),
+    entry("Disconnect PostgreSQL", ""),
 ];
 
 static TOOLS_MENU: [MenuEntry; 5] = [
@@ -112,6 +116,64 @@ static HELP_MENU: [MenuEntry; 2] = [
 pub enum ActivePane {
     Files,
     Preview,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum LeftTab {
+    Files,
+    Connections,
+    Postgres,
+}
+
+impl LeftTab {
+    pub fn tabs(pg_connected: bool) -> Vec<LeftTab> {
+        if pg_connected {
+            vec![LeftTab::Files, LeftTab::Postgres]
+        } else {
+            vec![LeftTab::Files, LeftTab::Connections]
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            LeftTab::Files => "Files",
+            LeftTab::Connections => "Connections",
+            LeftTab::Postgres => "Postgres",
+        }
+    }
+}
+
+const CONNECTIONS_FILE: &str = "connections.json";
+
+#[derive(Clone)]
+pub struct SavedConnection {
+    pub name: String,
+    pub host: String,
+    pub port: String,
+    pub user: String,
+    pub password: String,
+    pub dbname: String,
+}
+
+impl SavedConnection {
+    pub fn display_label(&self) -> String {
+        if self.name.is_empty() {
+            format!("{}@{}:{}/{}", self.user, self.host, self.port, self.dbname)
+        } else {
+            self.name.clone()
+        }
+    }
+
+    pub fn conn_str(&self) -> String {
+        let mut s = format!(
+            "host={} port={} user={} dbname={}",
+            self.host, self.port, self.user, self.dbname
+        );
+        if !self.password.is_empty() {
+            s.push_str(&format!(" password={}", self.password));
+        }
+        s
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -229,6 +291,229 @@ pub enum ImportField {
     Target,
 }
 
+pub struct PgConnectPopup {
+    pub fields: [PgField; PG_FIELD_COUNT],
+    pub uri: String,
+    pub uri_cursor: usize,
+    pub active_field: usize, // 0..PG_FIELD_COUNT = individual fields, PG_URI_FIELD = URI
+    pub rect: Option<(u16, u16, u16, u16)>,
+    pub error: Option<String>,
+}
+
+pub const PG_FIELD_COUNT: usize = 6;
+pub const PG_URI_FIELD: usize = PG_FIELD_COUNT; // index for the URI row
+const PG_TOTAL_FIELDS: usize = PG_FIELD_COUNT + 1;
+
+pub struct PgField {
+    pub label: &'static str,
+    pub value: String,
+    pub cursor: usize,
+    pub masked: bool,
+}
+
+impl PgField {
+    fn new(label: &'static str, default: &str, masked: bool) -> Self {
+        Self {
+            label,
+            value: default.to_string(),
+            cursor: default.len(),
+            masked,
+        }
+    }
+}
+
+// Field indices
+pub const PG_NAME: usize = 0;
+pub const PG_HOST: usize = 1;
+pub const PG_PORT: usize = 2;
+pub const PG_USER: usize = 3;
+pub const PG_PASSWORD: usize = 4;
+pub const PG_DBNAME: usize = 5;
+
+impl PgConnectPopup {
+    /// Build URI from individual fields.
+    pub fn build_uri(&self) -> String {
+        let host = self.fields[PG_HOST].value.trim();
+        let port = self.fields[PG_PORT].value.trim();
+        let user = self.fields[PG_USER].value.trim();
+        let password = self.fields[PG_PASSWORD].value.trim();
+        let dbname = self.fields[PG_DBNAME].value.trim();
+
+        let auth = if password.is_empty() {
+            user.to_string()
+        } else {
+            format!("{user}:{password}")
+        };
+        format!("postgresql://{auth}@{host}:{port}/{dbname}")
+    }
+
+    /// Sync individual fields from a URI string.
+    pub fn parse_uri_into_fields(&mut self) {
+        let uri = self.uri.trim();
+
+        // Strip scheme
+        let rest = uri
+            .strip_prefix("postgresql://")
+            .or_else(|| uri.strip_prefix("postgres://"))
+            .unwrap_or(uri);
+
+        // Split auth@hostpart/dbname
+        let (auth_part, after_at) = if let Some(pos) = rest.find('@') {
+            (&rest[..pos], &rest[pos + 1..])
+        } else {
+            ("", rest)
+        };
+
+        // Parse user:password
+        let (user, password) = if let Some(pos) = auth_part.find(':') {
+            (&auth_part[..pos], &auth_part[pos + 1..])
+        } else {
+            (auth_part, "")
+        };
+
+        // Parse host:port/dbname — strip query params
+        let after_at = if let Some(pos) = after_at.find('?') {
+            &after_at[..pos]
+        } else {
+            after_at
+        };
+
+        let (hostport, dbname) = if let Some(pos) = after_at.find('/') {
+            (&after_at[..pos], &after_at[pos + 1..])
+        } else {
+            (after_at, "")
+        };
+
+        let (host, port) = if let Some(pos) = hostport.rfind(':') {
+            (&hostport[..pos], &hostport[pos + 1..])
+        } else {
+            (hostport, "5432")
+        };
+
+        let set_field = |f: &mut PgField, val: &str| {
+            f.value = val.to_string();
+            f.cursor = val.len();
+        };
+        set_field(&mut self.fields[PG_HOST], host);
+        set_field(&mut self.fields[PG_PORT], port);
+        set_field(&mut self.fields[PG_USER], user);
+        set_field(&mut self.fields[PG_PASSWORD], password);
+        set_field(&mut self.fields[PG_DBNAME], dbname);
+    }
+
+    /// Sync URI string from fields, preserving cursor if possible.
+    pub fn sync_uri_from_fields(&mut self) {
+        self.uri = self.build_uri();
+        self.uri_cursor = self.uri.chars().count();
+    }
+}
+
+/// Represents a row in the flattened PG tree (schema or table).
+#[derive(Clone)]
+pub struct PgTreeEntry {
+    pub label: String,
+    pub is_schema: bool,
+    pub schema_name: String,
+    pub table_name: Option<String>,   // None for schema rows
+    #[allow(dead_code)]
+    pub table_type: Option<String>,
+    #[allow(dead_code)]
+    pub expanded: bool,
+}
+
+pub struct PgTreeState {
+    pub entries: Vec<PgTreeEntry>,
+    pub selected: usize,
+    pub scroll: usize,
+    pub schemas: Vec<pg::PgSchema>,
+    pub selected_table_info: Option<Vec<InfoLine>>,
+}
+
+impl PgTreeState {
+    pub fn from_schemas(schemas: Vec<pg::PgSchema>) -> Self {
+        let mut state = PgTreeState {
+            entries: Vec::new(),
+            selected: 0,
+            scroll: 0,
+            schemas,
+            selected_table_info: None,
+        };
+        state.rebuild_entries();
+        state
+    }
+
+    pub fn rebuild_entries(&mut self) {
+        self.entries.clear();
+        for schema in &self.schemas {
+            self.entries.push(PgTreeEntry {
+                label: format!(
+                    "{} {}",
+                    if schema.expanded { "[-]" } else { "[+]" },
+                    schema.name
+                ),
+                is_schema: true,
+                schema_name: schema.name.clone(),
+                table_name: None,
+                table_type: None,
+                expanded: schema.expanded,
+            });
+            if schema.expanded {
+                let table_count = schema.tables.len();
+                for (i, table) in schema.tables.iter().enumerate() {
+                    let is_last = i + 1 == table_count;
+                    let branch = if is_last { "`-" } else { "|-" };
+                    let icon = if table.table_type == "VIEW" { "V" } else { "T" };
+                    self.entries.push(PgTreeEntry {
+                        label: format!("   {branch} [{icon}] {}", table.name),
+                        is_schema: false,
+                        schema_name: schema.name.clone(),
+                        table_name: Some(table.name.clone()),
+                        table_type: Some(table.table_type.clone()),
+                        expanded: false,
+                    });
+                }
+            }
+        }
+        if self.selected >= self.entries.len() && !self.entries.is_empty() {
+            self.selected = self.entries.len() - 1;
+        }
+    }
+
+    pub fn build_table_info(&self, schema: &str, table: &str) -> Option<Vec<InfoLine>> {
+        for s in &self.schemas {
+            if s.name != schema {
+                continue;
+            }
+            for t in &s.tables {
+                if t.name != table {
+                    continue;
+                }
+                let mut lines = Vec::new();
+                lines.push(InfoLine::header(format!(
+                    "{}.{} ({})",
+                    schema, table, t.table_type
+                )));
+                lines.push(InfoLine::sep());
+                lines.push(InfoLine::header("Columns"));
+                for col in &t.columns {
+                    let nullable = if col.nullable { "NULL" } else { "NOT NULL" };
+                    let default = col
+                        .default
+                        .as_ref()
+                        .map(|d| format!(" DEFAULT {d}"))
+                        .unwrap_or_default();
+                    lines.push(InfoLine::label(format!(
+                        "  {} : {} {} {}",
+                        col.name, col.data_type, nullable, default
+                    )));
+                }
+                return Some(lines);
+            }
+        }
+        None
+    }
+}
+
 pub struct SqlState {
     pub lines: Vec<String>,
     pub cursor_row: usize,
@@ -306,6 +591,7 @@ pub struct ProgressPopup {
 pub enum LoadedFileType {
     Parquet,
     Csv,
+    Postgres,
 }
 
 pub struct LoadedParquet {
@@ -334,6 +620,11 @@ pub struct PreviewRender {
 }
 
 pub struct App {
+    pub left_tab: LeftTab,
+    pub left_tab_regions: Vec<(LeftTab, Rect)>,
+    pub saved_connections: Vec<SavedConnection>,
+    pub conn_selected: usize,
+    pub conn_scroll: usize,
     pub root: PathBuf,
     pub explorer_root: PathBuf,
     pub files: Vec<PathBuf>,
@@ -368,6 +659,9 @@ pub struct App {
     pub export_popup: Option<ExportPopup>,
     pub import_popup: Option<ImportPopup>,
     pub sql_state: Option<SqlState>,
+    pub pg_connect_popup: Option<PgConnectPopup>,
+    pub pg_conn_str: Option<String>,
+    pub pg_tree: Option<PgTreeState>,
     pub info_popup: Option<InfoPopup>,
     pub progress_popup: Option<ProgressPopup>,
     palette_item_regions: Vec<Rect>,
@@ -377,7 +671,13 @@ pub struct App {
 impl App {
     pub fn new(root: PathBuf) -> anyhow::Result<Self> {
         let palette_theme = Self::load_palette_theme_setting();
+        let saved_connections = Self::load_connections();
         let mut app = Self {
+            left_tab: LeftTab::Files,
+            left_tab_regions: Vec::new(),
+            saved_connections,
+            conn_selected: 0,
+            conn_scroll: 0,
             root,
             explorer_root: PathBuf::new(),
             files: Vec::new(),
@@ -414,6 +714,9 @@ impl App {
             export_popup: None,
             import_popup: None,
             sql_state: None,
+            pg_connect_popup: None,
+            pg_conn_str: None,
+            pg_tree: None,
             info_popup: None,
             progress_popup: None,
             palette_item_regions: Vec::new(),
@@ -895,6 +1198,8 @@ impl App {
             "Search" => self.open_search(),
             "Open SQL Pane" => self.toggle_sql_mode(),
             "Run Query" => self.run_sql_query(),
+            "Connect to PostgreSQL" => self.open_pg_connect_popup(),
+            "Disconnect PostgreSQL" => self.disconnect_pg(),
             "Palette" => self.open_palette_popup(),
             "Refresh" => self.rescan_files()?,
             "Keybindings" => self.open_keybindings_popup(),
@@ -961,7 +1266,7 @@ impl App {
         let meta = match file_type {
             LoadedFileType::Parquet => load_parquet_meta(&path)
                 .with_context(|| format!("unable to load {}", path.display()))?,
-            LoadedFileType::Csv => load_csv_meta(&path)
+            LoadedFileType::Csv | LoadedFileType::Postgres => load_csv_meta(&path)
                 .with_context(|| format!("unable to load {}", path.display()))?,
         };
         self.loaded = Some(LoadedParquet::from_meta(path, meta, file_type));
@@ -1401,6 +1706,17 @@ impl App {
             }
         }
 
+        // Left pane tab clicks
+        if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) {
+            for (tab, rect) in &self.left_tab_regions {
+                if rect.contains(mouse.column, mouse.row) {
+                    self.left_tab = *tab;
+                    self.active_pane = ActivePane::Files;
+                    return Ok(());
+                }
+            }
+        }
+
         let Some((files_rect, files_inner, preview_rect, rows_rect)) = self
             .mouse_regions
             .map(|regions| {
@@ -1423,7 +1739,7 @@ impl App {
             MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Drag(MouseButton::Left) => {
                 if files_inner.contains(x, y) {
                     self.active_pane = ActivePane::Files;
-                    self.select_file_at_mouse_row(y, files_inner, false);
+                    self.left_pane_mouse_select(y, files_inner, false);
                 } else if preview_rect.contains(x, y) || rows_rect.contains(x, y) {
                     self.active_pane = ActivePane::Preview;
                 } else if files_rect.contains(x, y) {
@@ -1433,7 +1749,7 @@ impl App {
             MouseEventKind::Up(MouseButton::Left) => {
                 if files_inner.contains(x, y) {
                     self.active_pane = ActivePane::Files;
-                    self.select_file_at_mouse_row(y, files_inner, true);
+                    self.left_pane_mouse_select(y, files_inner, true);
                 } else if preview_rect.contains(x, y) || rows_rect.contains(x, y) {
                     self.active_pane = ActivePane::Preview;
                 } else if files_rect.contains(x, y) {
@@ -1443,7 +1759,7 @@ impl App {
             MouseEventKind::ScrollUp => {
                 if files_rect.contains(x, y) {
                     self.active_pane = ActivePane::Files;
-                    self.move_selection(-1);
+                    self.left_pane_scroll(-1);
                 } else if preview_rect.contains(x, y) {
                     self.active_pane = ActivePane::Preview;
                     self.scroll_preview_rows(-3)?;
@@ -1452,7 +1768,7 @@ impl App {
             MouseEventKind::ScrollDown => {
                 if files_rect.contains(x, y) {
                     self.active_pane = ActivePane::Files;
-                    self.move_selection(1);
+                    self.left_pane_scroll(1);
                 } else if preview_rect.contains(x, y) {
                     self.active_pane = ActivePane::Preview;
                     self.scroll_preview_rows(3)?;
@@ -1610,9 +1926,15 @@ impl App {
         let file_type = loaded.file_type;
 
         self.set_status(format!("Sorting by {col_name}..."));
-        let indices = match file_type {
-            LoadedFileType::Parquet => compute_sort_indices(&path, col_index, false)?,
-            LoadedFileType::Csv => compute_csv_sort_indices(&path, col_index, false)?,
+        let indices = if self.pg_conn_str.is_some() {
+            // PG tables: sort in-memory rows
+            let rows = &self.loaded.as_ref().unwrap().cache_rows;
+            compute_inmemory_sort_indices(rows, col_index)
+        } else {
+            match file_type {
+                LoadedFileType::Parquet => compute_sort_indices(&path, col_index, false)?,
+                LoadedFileType::Csv | LoadedFileType::Postgres => compute_csv_sort_indices(&path, col_index, false)?,
+            }
         };
         if let Some(loaded) = self.loaded.as_mut() {
             loaded.sort_state = Some(SortState {
@@ -1727,8 +2049,8 @@ impl App {
         let Some(loaded) = &self.loaded else {
             return Ok(());
         };
-        if loaded.file_type == LoadedFileType::Csv {
-            return Ok(()); // CSV files don't have info tabs
+        if loaded.file_type != LoadedFileType::Parquet {
+            return Ok(()); // Only Parquet files have info tabs
         }
         let path = loaded.path.clone();
 
@@ -2099,7 +2421,7 @@ impl App {
         self.set_status(format!("Searching {scope_label} for '{query}'..."));
         let results = match file_type {
             LoadedFileType::Parquet => search_parquet_rows(&path, query, col_index, CELL_CHAR_LIMIT)?,
-            LoadedFileType::Csv => search_csv_rows(&path, query, col_index, CELL_CHAR_LIMIT)?,
+            LoadedFileType::Csv | LoadedFileType::Postgres => search_csv_rows(&path, query, col_index, CELL_CHAR_LIMIT)?,
         };
         let count = results.matching_rows.len();
         let capped = results.capped;
@@ -2126,7 +2448,7 @@ impl App {
             self.set_status("Load a file first");
             return;
         };
-        if loaded.file_type == LoadedFileType::Csv {
+        if loaded.file_type != LoadedFileType::Parquet {
             self.set_status("Export to CSV is only available for Parquet files");
             return;
         }
@@ -2356,17 +2678,39 @@ impl App {
             self.sql_state = None;
             self.set_status("SQL pane closed");
         } else {
+            let (default_query, cursor_col) = if let Some(tree) = &self.pg_tree {
+                // Pre-fill with the currently selected table if any
+                let table_ref = tree
+                    .entries
+                    .get(tree.selected)
+                    .and_then(|e| {
+                        e.table_name.as_ref().map(|t| format!("{}.{}", e.schema_name, t))
+                    })
+                    .unwrap_or_default();
+                if table_ref.is_empty() {
+                    ("SELECT * FROM  LIMIT 100".to_string(), 14)
+                } else {
+                    let q = format!("SELECT * FROM {table_ref} LIMIT 100");
+                    let col = q.chars().count();
+                    (q, col)
+                }
+            } else if self.pg_conn_str.is_some() {
+                ("SELECT * FROM  LIMIT 100".to_string(), 14)
+            } else {
+                ("SELECT * FROM data LIMIT 100".to_string(), 27)
+            };
             self.sql_state = Some(SqlState {
-                lines: vec!["SELECT * FROM data LIMIT 100".to_string()],
+                lines: vec![default_query],
                 cursor_row: 0,
-                cursor_col: 27,
+                cursor_col,
                 result: None,
                 error: None,
                 result_scroll: 0,
                 col_offset: 0,
             });
             self.active_pane = ActivePane::Preview;
-            self.set_status("SQL pane opened — Ctrl+Enter to run query");
+            let backend = if self.pg_conn_str.is_some() { "PostgreSQL" } else { "DuckDB" };
+            self.set_status(format!("SQL pane opened ({backend}) — F5 to run query"));
         }
     }
 
@@ -2380,17 +2724,25 @@ impl App {
             self.set_status("Empty query");
             return;
         }
-        let path = self
-            .loaded
-            .as_ref()
-            .map(|l| l.path.clone())
-            .unwrap_or_default();
-        match run_sql(&path, &query) {
+
+        let result = if let Some(conn_str) = &self.pg_conn_str {
+            pg::run_pg_sql(conn_str, &query)
+        } else {
+            let path = self
+                .loaded
+                .as_ref()
+                .map(|l| l.path.clone())
+                .unwrap_or_default();
+            run_sql(&path, &query)
+        };
+
+        match result {
             Ok(result) => {
+                let backend = if self.pg_conn_str.is_some() { "PG" } else { "SQL" };
                 let msg = if result.capped {
-                    format!("SQL: {} rows (capped at 10,000)", result.row_count)
+                    format!("{backend}: {} rows (capped at 10,000)", result.row_count)
                 } else {
-                    format!("SQL: {} rows", result.row_count)
+                    format!("{backend}: {} rows", result.row_count)
                 };
                 if let Some(sql) = self.sql_state.as_mut() {
                     sql.result = Some(result);
@@ -2409,13 +2761,369 @@ impl App {
         }
     }
 
+    // ------------------------------------------------------------------
+    // PostgreSQL connection
+    // ------------------------------------------------------------------
+
+    pub fn open_pg_connect_popup(&mut self) {
+        self.open_pg_connect_popup_with(None);
+    }
+
+    fn open_pg_connect_popup_with(&mut self, conn: Option<&SavedConnection>) {
+        let mut popup = PgConnectPopup {
+            fields: [
+                PgField::new("Name", conn.map(|c| c.name.as_str()).unwrap_or(""), false),
+                PgField::new("Host", conn.map(|c| c.host.as_str()).unwrap_or("127.0.0.1"), false),
+                PgField::new("Port", conn.map(|c| c.port.as_str()).unwrap_or("5432"), false),
+                PgField::new("User", conn.map(|c| c.user.as_str()).unwrap_or("postgres"), false),
+                PgField::new("Password", conn.map(|c| c.password.as_str()).unwrap_or(""), true),
+                PgField::new("Database", conn.map(|c| c.dbname.as_str()).unwrap_or("postgres"), false),
+            ],
+            uri: String::new(),
+            uri_cursor: 0,
+            active_field: PG_HOST,
+            rect: None,
+            error: None,
+        };
+        popup.sync_uri_from_fields();
+        self.pg_connect_popup = Some(popup);
+    }
+
+    pub fn conn_move_selection(&mut self, delta: isize) {
+        if self.saved_connections.is_empty() { return; }
+        let next = self.conn_selected as isize + delta;
+        self.conn_selected = next.clamp(0, (self.saved_connections.len() - 1) as isize) as usize;
+    }
+
+    pub fn conn_ensure_visible(&mut self, visible_rows: usize) {
+        if visible_rows == 0 { return; }
+        if self.conn_selected < self.conn_scroll {
+            self.conn_scroll = self.conn_selected;
+        } else if self.conn_selected >= self.conn_scroll + visible_rows {
+            self.conn_scroll = self.conn_selected + 1 - visible_rows;
+        }
+    }
+
+    pub fn conn_activate_selected(&mut self) {
+        if self.saved_connections.is_empty() { return; }
+        let conn = self.saved_connections[self.conn_selected].clone();
+        self.open_pg_connect_popup_with(Some(&conn));
+    }
+
+    pub fn conn_delete_selected(&mut self) {
+        if self.saved_connections.is_empty() { return; }
+        self.saved_connections.remove(self.conn_selected);
+        if self.conn_selected >= self.saved_connections.len() && !self.saved_connections.is_empty() {
+            self.conn_selected = self.saved_connections.len() - 1;
+        }
+        let _ = self.save_connections();
+        self.set_status("Connection deleted");
+    }
+
+    pub fn disconnect_pg(&mut self) {
+        if self.pg_conn_str.is_some() {
+            self.pg_conn_str = None;
+            self.pg_tree = None;
+            self.sql_state = None;
+            self.loaded = None;
+            self.left_tab = LeftTab::Connections;
+            self.set_status("Disconnected from PostgreSQL");
+        } else {
+            self.set_status("Not connected to PostgreSQL");
+        }
+    }
+
+    pub fn pg_tree_move_selection(&mut self, delta: isize) {
+        let Some(tree) = self.pg_tree.as_mut() else { return };
+        if tree.entries.is_empty() { return; }
+        let next = tree.selected as isize + delta;
+        tree.selected = next.clamp(0, (tree.entries.len() - 1) as isize) as usize;
+        self.pg_tree_update_info();
+        self.pg_load_selected_table();
+    }
+
+    pub fn pg_tree_ensure_visible(&mut self, visible_rows: usize) {
+        let Some(tree) = self.pg_tree.as_mut() else { return };
+        if visible_rows == 0 { return; }
+        if tree.selected < tree.scroll {
+            tree.scroll = tree.selected;
+        } else if tree.selected >= tree.scroll + visible_rows {
+            tree.scroll = tree.selected + 1 - visible_rows;
+        }
+    }
+
+    pub fn pg_tree_toggle_or_select(&mut self) {
+        let Some(tree) = self.pg_tree.as_mut() else { return };
+        if tree.entries.is_empty() { return; }
+
+        let entry = &tree.entries[tree.selected];
+        if entry.is_schema {
+            // Toggle schema expansion
+            let schema_name = entry.schema_name.clone();
+            if let Some(s) = tree.schemas.iter_mut().find(|s| s.name == schema_name) {
+                s.expanded = !s.expanded;
+            }
+            tree.rebuild_entries();
+        } else {
+            // Table selected — build info and load data for right pane
+            self.pg_tree_update_info();
+            self.pg_load_selected_table();
+        }
+    }
+
+    /// Load data from the selected PG table into the preview (reuses LoadedParquet).
+    fn pg_load_selected_table(&mut self) {
+        let Some(tree) = &self.pg_tree else { return };
+        let Some(conn_str) = &self.pg_conn_str else { return };
+
+        let entry = match tree.entries.get(tree.selected) {
+            Some(e) => e,
+            None => return,
+        };
+        let table_name = match &entry.table_name {
+            Some(t) => t.clone(),
+            None => {
+                // Schema row selected - clear preview
+                self.loaded = None;
+                return;
+            }
+        };
+        let schema_name = entry.schema_name.clone();
+        let qualified = format!("{schema_name}.{table_name}");
+
+        // Build schema lines from the PG column metadata
+        let mut schema_lines = Vec::new();
+        if let Some(info) = &tree.selected_table_info {
+            for line in info {
+                schema_lines.push(line.text.clone());
+            }
+        }
+
+        // Query first batch of rows
+        let query = format!(
+            "SELECT * FROM {qualified} LIMIT {DEFAULT_ROW_WINDOW}"
+        );
+        match pg::run_pg_sql(conn_str, &query) {
+            Ok(result) => {
+                let total_cols = result.column_names.len();
+                let total_rows = result.row_count;
+                self.loaded = Some(LoadedParquet {
+                    file_type: LoadedFileType::Postgres,
+                    path: std::path::PathBuf::from(&qualified),
+                    schema_lines,
+                    total_rows,
+                    total_cols,
+                    row_offset: 0,
+                    col_offset: 0,
+                    viewport_rows: 0,
+                    viewport_cols: 0,
+                    cache_row_start: 0,
+                    cache_col_start: 0,
+                    cache_columns: result.column_names,
+                    cache_rows: result.rows,
+                    stats_lines: None,
+                    metadata_lines: None,
+                    sort_state: None,
+                });
+                self.info_tab = InfoTab::Schema;
+                self.info_scroll = 0;
+                self.set_status(format!("Loaded {qualified} ({total_rows} rows, {total_cols} cols)"));
+            }
+            Err(e) => {
+                self.loaded = None;
+                self.set_status(format!("Error loading {qualified}: {e:#}"));
+            }
+        }
+    }
+
+    fn pg_tree_update_info(&mut self) {
+        let Some(tree) = self.pg_tree.as_mut() else { return };
+        if tree.entries.is_empty() { return; }
+
+        let entry = &tree.entries[tree.selected];
+        if let Some(table_name) = &entry.table_name {
+            let info = tree.build_table_info(&entry.schema_name, table_name);
+            tree.selected_table_info = info;
+        } else {
+            tree.selected_table_info = None;
+        }
+    }
+
+    fn execute_pg_connect(&mut self) {
+        let Some(popup) = &self.pg_connect_popup else {
+            return;
+        };
+
+        let name = popup.fields[PG_NAME].value.trim().to_string();
+        let host = popup.fields[PG_HOST].value.trim().to_string();
+        let port = popup.fields[PG_PORT].value.trim().to_string();
+        let user = popup.fields[PG_USER].value.trim().to_string();
+        let password = popup.fields[PG_PASSWORD].value.trim().to_string();
+        let dbname = popup.fields[PG_DBNAME].value.trim().to_string();
+
+        if host.is_empty() {
+            if let Some(p) = self.pg_connect_popup.as_mut() {
+                p.error = Some("Host is required".to_string());
+            }
+            return;
+        }
+        if dbname.is_empty() {
+            if let Some(p) = self.pg_connect_popup.as_mut() {
+                p.error = Some("Database is required".to_string());
+            }
+            return;
+        }
+
+        let saved = SavedConnection {
+            name: name.clone(),
+            host: host.clone(),
+            port: port.clone(),
+            user: user.clone(),
+            password: password.clone(),
+            dbname: dbname.clone(),
+        };
+        let conn_str = saved.conn_str();
+
+        match pg::test_connection(&conn_str) {
+            Ok(()) => {
+                // Save/update the connection
+                if let Some(existing) = self.saved_connections.iter_mut().find(|c| {
+                    c.host == host && c.port == port && c.user == user && c.dbname == dbname
+                }) {
+                    existing.name = name;
+                    existing.password = password;
+                } else {
+                    self.saved_connections.push(saved);
+                }
+                let _ = self.save_connections();
+
+                // Fetch database tree
+                match pg::fetch_db_tree(&conn_str) {
+                    Ok(schemas) => {
+                        let table_count: usize = schemas.iter().map(|s| s.tables.len()).sum();
+                        self.pg_tree = Some(PgTreeState::from_schemas(schemas));
+                        self.pg_conn_str = Some(conn_str);
+                        self.pg_connect_popup = None;
+                        self.sql_state = None;
+                        self.loaded = None;
+                        self.left_tab = LeftTab::Postgres;
+                        self.set_status(format!(
+                            "Connected to PostgreSQL — {table_count} tables"
+                        ));
+                    }
+                    Err(e) => {
+                        self.pg_conn_str = Some(conn_str);
+                        self.pg_connect_popup = None;
+                        self.sql_state = None;
+                        self.pg_tree = None;
+                        self.left_tab = LeftTab::Postgres;
+                        self.set_status(format!("Connected (no tree: {e:#})"));
+                    }
+                }
+            }
+            Err(e) => {
+                if let Some(p) = self.pg_connect_popup.as_mut() {
+                    p.error = Some(format!("{e:#}"));
+                }
+            }
+        }
+    }
+
+    pub fn handle_pg_connect_key(&mut self, key: KeyEvent) -> anyhow::Result<bool> {
+        let Some(popup) = self.pg_connect_popup.as_mut() else {
+            return Ok(false);
+        };
+
+        let editing_uri = popup.active_field == PG_URI_FIELD;
+
+        match key.code {
+            KeyCode::Esc => {
+                self.pg_connect_popup = None;
+                self.set_status("Connection cancelled");
+                return Ok(true);
+            }
+            KeyCode::Tab | KeyCode::Down => {
+                popup.active_field = (popup.active_field + 1) % PG_TOTAL_FIELDS;
+                return Ok(true);
+            }
+            KeyCode::BackTab | KeyCode::Up => {
+                popup.active_field = (popup.active_field + PG_TOTAL_FIELDS - 1) % PG_TOTAL_FIELDS;
+                return Ok(true);
+            }
+            KeyCode::Enter => {
+                // If editing URI, sync fields first
+                if editing_uri {
+                    popup.parse_uri_into_fields();
+                }
+                self.execute_pg_connect();
+                return Ok(true);
+            }
+            _ => {}
+        }
+
+        // Get mutable ref to the active input and cursor
+        let (input, cursor) = if editing_uri {
+            (&mut popup.uri, &mut popup.uri_cursor)
+        } else {
+            let f = &mut popup.fields[popup.active_field];
+            (&mut f.value, &mut f.cursor)
+        };
+
+        match key.code {
+            KeyCode::Backspace => {
+                if *cursor > 0 {
+                    let from = char_to_byte_index(input, *cursor - 1);
+                    let to = char_to_byte_index(input, *cursor);
+                    input.replace_range(from..to, "");
+                    *cursor -= 1;
+                }
+            }
+            KeyCode::Delete => {
+                if *cursor < input.chars().count() {
+                    let from = char_to_byte_index(input, *cursor);
+                    let to = char_to_byte_index(input, *cursor + 1);
+                    input.replace_range(from..to, "");
+                }
+            }
+            KeyCode::Left => {
+                *cursor = cursor.saturating_sub(1);
+            }
+            KeyCode::Right => {
+                *cursor = cmp::min(*cursor + 1, input.chars().count());
+            }
+            KeyCode::Home => {
+                *cursor = 0;
+            }
+            KeyCode::End => {
+                *cursor = input.chars().count();
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                popup.error = None;
+                let byte_idx = char_to_byte_index(input, *cursor);
+                input.insert(byte_idx, c);
+                *cursor += 1;
+            }
+            _ => return Ok(false),
+        }
+
+        // Sync: editing individual field -> update URI; editing URI -> update fields
+        let popup = self.pg_connect_popup.as_mut().unwrap();
+        if editing_uri {
+            popup.parse_uri_into_fields();
+        } else {
+            popup.sync_uri_from_fields();
+        }
+
+        Ok(true)
+    }
+
     pub fn handle_sql_key(&mut self, key: KeyEvent) -> anyhow::Result<bool> {
         let Some(sql) = self.sql_state.as_mut() else {
             return Ok(false);
         };
 
-        // Ctrl+Enter: run query
-        if key.code == KeyCode::Enter && key.modifiers.contains(KeyModifiers::CONTROL) {
+        // Run query: F5
+        if key.code == KeyCode::F(5) {
             let _ = sql;
             self.run_sql_query();
             return Ok(true);
@@ -2556,7 +3264,7 @@ impl App {
                 String::new(),
                 "SQL (DuckDB)".to_string(),
                 "  Ctrl+D           Toggle SQL pane".to_string(),
-                "  Ctrl+Enter       Run SQL query".to_string(),
+                "  F5               Run SQL query".to_string(),
                 "  Shift+Up/Down    Scroll results".to_string(),
                 "  Shift+Left/Right Scroll result columns".to_string(),
                 String::new(),
@@ -2851,12 +3559,73 @@ impl App {
     }
 
     fn settings_path() -> Option<PathBuf> {
+        Self::config_dir().map(|d| d.join(SETTINGS_FILE))
+    }
+
+    fn connections_path() -> Option<PathBuf> {
+        Self::config_dir().map(|d| d.join(CONNECTIONS_FILE))
+    }
+
+    fn config_dir() -> Option<PathBuf> {
         if let Some(path) = env::var_os("XDG_CONFIG_HOME") {
-            return Some(PathBuf::from(path).join(APP_NAME).join(SETTINGS_FILE));
+            return Some(PathBuf::from(path).join(APP_NAME));
         }
         env::var_os("HOME")
             .map(PathBuf::from)
-            .map(|home| home.join(".config").join(APP_NAME).join(SETTINGS_FILE))
+            .map(|home| home.join(".config").join(APP_NAME))
+    }
+
+    fn load_connections() -> Vec<SavedConnection> {
+        let Some(path) = Self::connections_path() else {
+            return Vec::new();
+        };
+        let Ok(contents) = fs::read_to_string(path) else {
+            return Vec::new();
+        };
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(&contents) else {
+            return Vec::new();
+        };
+        let Some(arr) = val.as_array() else {
+            return Vec::new();
+        };
+        arr.iter()
+            .filter_map(|obj| {
+                Some(SavedConnection {
+                    name: obj.get("name")?.as_str()?.to_string(),
+                    host: obj.get("host")?.as_str()?.to_string(),
+                    port: obj.get("port")?.as_str().unwrap_or("5432").to_string(),
+                    user: obj.get("user")?.as_str()?.to_string(),
+                    password: obj.get("password").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    dbname: obj.get("dbname")?.as_str()?.to_string(),
+                })
+            })
+            .collect()
+    }
+
+    fn save_connections(&self) -> std::io::Result<()> {
+        let Some(path) = Self::connections_path() else {
+            return Ok(());
+        };
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let arr: Vec<serde_json::Value> = self
+            .saved_connections
+            .iter()
+            .map(|c| {
+                serde_json::json!({
+                    "name": c.name,
+                    "host": c.host,
+                    "port": c.port,
+                    "user": c.user,
+                    "password": c.password,
+                    "dbname": c.dbname,
+                })
+            })
+            .collect();
+        let json = serde_json::to_string_pretty(&serde_json::Value::Array(arr))
+            .unwrap_or_else(|_| "[]".to_string());
+        fs::write(path, json)
     }
 
     fn open_explorer_parent(&mut self) {
@@ -3001,6 +3770,92 @@ impl App {
         }
     }
 
+    fn left_pane_mouse_select(&mut self, y: u16, files_inner: Rect, track_double_click: bool) {
+        match self.left_tab {
+            LeftTab::Postgres => {
+                self.select_pg_tree_at_mouse_row(y, files_inner, track_double_click);
+            }
+            LeftTab::Connections => {
+                self.select_conn_at_mouse_row(y, files_inner, track_double_click);
+            }
+            LeftTab::Files => {
+                self.select_file_at_mouse_row(y, files_inner, track_double_click);
+            }
+        }
+    }
+
+    fn left_pane_scroll(&mut self, delta: isize) {
+        match self.left_tab {
+            LeftTab::Postgres => {
+                self.pg_tree_move_selection(delta);
+            }
+            LeftTab::Connections => self.conn_move_selection(delta),
+            LeftTab::Files => self.move_selection(delta),
+        }
+    }
+
+    fn select_conn_at_mouse_row(&mut self, y: u16, files_inner: Rect, track_double_click: bool) {
+        if files_inner.height == 0 || self.saved_connections.is_empty() || y < files_inner.y {
+            return;
+        }
+        let row = usize::from(y.saturating_sub(files_inner.y));
+        let idx = self.conn_scroll + row;
+        if idx >= self.saved_connections.len() {
+            return;
+        }
+        self.conn_selected = idx;
+        if track_double_click {
+            let now = Instant::now();
+            if let Some((last_idx, clicked_at)) = self.last_file_click {
+                if last_idx == idx
+                    && now.duration_since(clicked_at) <= Duration::from_millis(DOUBLE_CLICK_MS)
+                {
+                    self.conn_activate_selected();
+                    return;
+                }
+            }
+            self.last_file_click = Some((idx, now));
+        }
+    }
+
+    fn select_pg_tree_at_mouse_row(
+        &mut self,
+        y: u16,
+        files_inner: Rect,
+        track_double_click: bool,
+    ) {
+        let Some(tree) = self.pg_tree.as_mut() else {
+            return;
+        };
+        if files_inner.height == 0 || tree.entries.is_empty() || y < files_inner.y {
+            return;
+        }
+
+        let row = usize::from(y.saturating_sub(files_inner.y));
+        let idx = tree.scroll + row;
+        if idx >= tree.entries.len() {
+            return;
+        }
+
+        tree.selected = idx;
+
+        if track_double_click {
+            let now = Instant::now();
+            if let Some((last_idx, clicked_at)) = self.last_file_click {
+                if last_idx == idx
+                    && now.duration_since(clicked_at) <= Duration::from_millis(DOUBLE_CLICK_MS)
+                {
+                    self.pg_tree_toggle_or_select();
+                    return;
+                }
+            }
+            self.last_file_click = Some((idx, now));
+        }
+
+        self.pg_tree_update_info();
+        self.pg_load_selected_table();
+    }
+
     fn preview_window_legend(&self, width: usize) -> String {
         let text = self.loaded.as_ref().map_or_else(
             || " No parquet loaded ".to_string(),
@@ -3064,11 +3919,25 @@ impl App {
             (loaded.path.clone(), loaded.file_type, row_start, row_count, projection, sorted_row_indices)
         };
 
+        // Postgres data is fully in-memory; just reorder for sort if needed
+        if file_type == LoadedFileType::Postgres {
+            if let Some(row_indices) = sorted_row_indices {
+                let loaded = self.loaded.as_mut().expect("loaded exists");
+                let orig = loaded.cache_rows.clone();
+                loaded.cache_rows = row_indices
+                    .iter()
+                    .filter_map(|&i| orig.get(i).cloned())
+                    .collect();
+                loaded.cache_row_start = row_start;
+            }
+            return Ok(());
+        }
+
         let slice = if let Some(row_indices) = sorted_row_indices {
             let mut s = match file_type {
                 LoadedFileType::Parquet => load_parquet_rows(&path, &row_indices, &projection, CELL_CHAR_LIMIT)
                     .with_context(|| format!("unable to read sorted preview for {}", path.display()))?,
-                LoadedFileType::Csv => load_csv_rows(&path, &row_indices, &projection, CELL_CHAR_LIMIT)
+                LoadedFileType::Csv | LoadedFileType::Postgres => load_csv_rows(&path, &row_indices, &projection, CELL_CHAR_LIMIT)
                     .with_context(|| format!("unable to read sorted CSV preview for {}", path.display()))?,
             };
             s.row_start = row_start;
@@ -3077,7 +3946,7 @@ impl App {
             match file_type {
                 LoadedFileType::Parquet => load_parquet_slice(&path, row_start, row_count, &projection, CELL_CHAR_LIMIT)
                     .with_context(|| format!("unable to read preview window for {}", path.display()))?,
-                LoadedFileType::Csv => load_csv_slice(&path, row_start, row_count, &projection, CELL_CHAR_LIMIT)
+                LoadedFileType::Csv | LoadedFileType::Postgres => load_csv_slice(&path, row_start, row_count, &projection, CELL_CHAR_LIMIT)
                     .with_context(|| format!("unable to read CSV preview for {}", path.display()))?,
             }
         };
@@ -3143,6 +4012,21 @@ fn char_to_byte_index(value: &str, char_idx: usize) -> usize {
 
 fn truncate_str(s: &str, max: usize) -> String {
     s.chars().take(max).collect()
+}
+
+/// Sort indices for in-memory row data (used for PG tables).
+fn compute_inmemory_sort_indices(rows: &[Vec<String>], col_index: usize) -> Vec<usize> {
+    let mut indices: Vec<usize> = (0..rows.len()).collect();
+    indices.sort_by(|&a, &b| {
+        let va = rows[a].get(col_index).map(|s| s.as_str()).unwrap_or("");
+        let vb = rows[b].get(col_index).map(|s| s.as_str()).unwrap_or("");
+        // Try numeric comparison first
+        match (va.parse::<f64>(), vb.parse::<f64>()) {
+            (Ok(na), Ok(nb)) => na.partial_cmp(&nb).unwrap_or(std::cmp::Ordering::Equal),
+            _ => va.cmp(vb),
+        }
+    });
+    indices
 }
 
 fn pad_or_clip(text: &str, width: usize) -> String {
