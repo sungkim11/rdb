@@ -1,12 +1,15 @@
 use std::cmp;
 
+use unicode_width::UnicodeWidthChar;
+use unicode_width::UnicodeWidthStr;
+
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 
-use crate::app::{ActivePane, App, InfoLineKind, InfoTab, OpenMenu, SearchMode};
+use crate::app::{ActivePane, App, ImportField, InfoLineKind, InfoTab, LoadedFileType, OpenMenu, SearchMode, SearchScope};
 use crate::theme::PaletteTheme;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
@@ -70,8 +73,16 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         draw_export_popup(frame, area, app);
     }
 
+    if app.import_popup.is_some() {
+        draw_import_popup(frame, area, app);
+    }
+
     if app.info_popup.is_some() {
         draw_info_popup(frame, area, app);
+    }
+
+    if app.progress_popup.is_some() {
+        draw_progress_popup(frame, area, app);
     }
 }
 
@@ -82,7 +93,7 @@ fn draw_top_bar(frame: &mut Frame, area: Rect, app: &mut App) {
         .bg(app.theme.active_bg)
         .add_modifier(Modifier::BOLD);
 
-    let mut spans = vec![Span::styled(" rdb ", active)];
+    let mut spans = vec![Span::styled(" rdb v0.1 ", active)];
     spans.push(Span::styled("  ", base));
     let menu_style = |menu: OpenMenu| -> Style {
         if app.open_menu == Some(menu) { active } else { base }
@@ -228,8 +239,15 @@ fn draw_files_pane(frame: &mut Frame, area: Rect, app: &mut App) -> Rect {
 }
 
 fn draw_preview_pane(frame: &mut Frame, area: Rect, app: &mut App) -> Rect {
+    let is_csv = app
+        .loaded
+        .as_ref()
+        .is_some_and(|l| l.file_type == LoadedFileType::Csv);
+
     let title = if app.active_pane == ActivePane::Preview {
-        " Parquet Preview [focused] "
+        if is_csv { " CSV Preview [focused] " } else { " Parquet Preview [focused] " }
+    } else if is_csv {
+        " CSV Preview "
     } else {
         " Parquet Preview "
     };
@@ -247,20 +265,26 @@ fn draw_preview_pane(frame: &mut Frame, area: Rect, app: &mut App) -> Rect {
     frame.render_widget(block.clone(), area);
     let inner = block.inner(area);
 
-    let sections = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(34), Constraint::Percentage(66)])
-        .split(inner);
+    let rows_area = if is_csv {
+        // CSV: no info tabs, full area for rows
+        inner
+    } else {
+        let sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(34), Constraint::Percentage(66)])
+            .split(inner);
 
-    draw_info_tabs(frame, sections[0], app);
+        draw_info_tabs(frame, sections[0], app);
+        sections[1]
+    };
 
     let rows_block = Block::default()
         .title(" Rows (Left/Right: cols, Up/Down: rows) ")
         .title_style(Style::default().fg(app.theme.fg).bg(app.theme.bg))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(app.theme.panel_border).bg(app.theme.bg));
-    frame.render_widget(rows_block.clone(), sections[1]);
-    let rows_inner = rows_block.inner(sections[1]);
+    frame.render_widget(rows_block.clone(), rows_area);
+    let rows_inner = rows_block.inner(rows_area);
     // Fill rows inner with menu_bg for consistent background
     frame.render_widget(
         Paragraph::new("").style(Style::default().bg(app.theme.menu_bg)),
@@ -268,7 +292,7 @@ fn draw_preview_pane(frame: &mut Frame, area: Rect, app: &mut App) -> Rect {
     );
 
     let total_height = usize::from(rows_inner.height);
-    let row_body_height = total_height.saturating_sub(2);
+    let row_body_height = total_height.saturating_sub(3); // padding + header + divider
     let viewport_result = app.set_preview_viewport(row_body_height, usize::from(rows_inner.width));
     app.apply_result(viewport_result);
 
@@ -315,6 +339,19 @@ fn draw_preview_pane(frame: &mut Frame, area: Rect, app: &mut App) -> Rect {
         })
         .collect();
 
+    // Padding line above column headers with matching separators
+    let pad_cells: Vec<String> = (0..header_cells.len())
+        .map(|_| " ".repeat(cell_width))
+        .collect();
+    let pad_line = format_table_row(Some(" ".repeat(1)), pad_cells);
+    lines.push(Line::styled(
+        clip_or_pad(&pad_line, table_width),
+        Style::default()
+            .fg(app.theme.active_fg)
+            .bg(app.theme.active_bg)
+            .add_modifier(Modifier::BOLD),
+    ));
+
     let header_line = format_table_row(Some("#".to_string()), header_cells);
     lines.push(Line::styled(
         clip_or_pad(&header_line, table_width),
@@ -325,12 +362,13 @@ fn draw_preview_pane(frame: &mut Frame, area: Rect, app: &mut App) -> Rect {
     ));
 
     // Store header column hit regions for mouse click sorting
-    let header_y = rows_inner.y;
+    // Cover both the padding line and the header line (height=2)
+    let pad_y = rows_inner.y;
     let mut col_regions = Vec::new();
     let mut cx = rows_inner.x + 6 + 3; // skip row-index column + separator
     for (i, _) in preview.header.iter().enumerate() {
         let w = cell_width as u16;
-        col_regions.push((col_offset + i, cx, header_y, w, 1u16));
+        col_regions.push((col_offset + i, cx, pad_y, w, 2u16));
         cx += w + 3; // cell + separator
     }
     app.set_header_col_regions(col_regions);
@@ -561,10 +599,10 @@ fn draw_palette_popup(frame: &mut Frame, area: Rect, app: &mut App) {
     app.set_palette_item_regions(item_regions);
 }
 
-fn draw_file_action_popup(frame: &mut Frame, area: Rect, app: &App) {
-    let Some(popup) = app.file_action_popup.as_ref() else {
+fn draw_file_action_popup(frame: &mut Frame, area: Rect, app: &mut App) {
+    if app.file_action_popup.is_none() {
         return;
-    };
+    }
 
     if area.width < 30 || area.height < 7 {
         return;
@@ -579,10 +617,40 @@ fn draw_file_action_popup(frame: &mut Frame, area: Rect, app: &App) {
         height,
     );
 
+    // Store rect for mouse click-outside detection
+    if let Some(popup) = app.file_action_popup.as_mut() {
+        popup.rect = Some((rect.x, rect.y, rect.width, rect.height));
+    }
+
+    let popup = app.file_action_popup.as_ref().unwrap();
     let inner_width = usize::from(width.saturating_sub(2));
 
     let label = format!(" Source: {}", app.display_path(&popup.source));
-    let input = popup.input.clone();
+    let input = &popup.input;
+    let cursor = popup.cursor;
+
+    // Build input line with a visible cursor (underscore block)
+    let input_style = Style::default().fg(app.theme.fg).bg(app.theme.line_bg);
+    let cursor_style = Style::default()
+        .fg(app.theme.active_fg)
+        .bg(app.theme.active_bg);
+
+    let before: String = input.chars().take(cursor).collect();
+    let cursor_char = input.chars().nth(cursor).unwrap_or(' ');
+    let after: String = input.chars().skip(cursor + 1).collect();
+    let after_pad_len = inner_width
+        .saturating_sub(1) // leading space
+        .saturating_sub(UnicodeWidthStr::width(before.as_str()))
+        .saturating_sub(UnicodeWidthChar::width(cursor_char).unwrap_or(1))
+        .saturating_sub(UnicodeWidthStr::width(after.as_str()));
+    let after_padded = format!("{after}{}", " ".repeat(after_pad_len));
+
+    let input_line = Line::from(vec![
+        Span::styled(" ", input_style),
+        Span::styled(before, input_style),
+        Span::styled(cursor_char.to_string(), cursor_style),
+        Span::styled(after_padded, input_style),
+    ]);
 
     let lines = vec![
         Line::styled(
@@ -593,10 +661,7 @@ fn draw_file_action_popup(frame: &mut Frame, area: Rect, app: &App) {
             clip_or_pad(" Target:", inner_width),
             Style::default().fg(app.theme.menu_fg).bg(app.theme.menu_bg),
         ),
-        Line::styled(
-            clip_or_pad(&input, inner_width),
-            Style::default().fg(app.theme.fg).bg(app.theme.line_bg),
-        ),
+        input_line,
         Line::styled(
             clip_or_pad(" Enter: apply  Esc: cancel", inner_width),
             Style::default().fg(app.theme.dim_fg).bg(app.theme.menu_bg),
@@ -622,9 +687,9 @@ fn draw_file_action_popup(frame: &mut Frame, area: Rect, app: &App) {
 // ---------------------------------------------------------------------------
 
 fn draw_info_tabs(frame: &mut Frame, area: Rect, app: &mut App) {
-    // Draw tab bar + content inside the given area
-    let tab_bar_height = 1u16;
-    if area.height < tab_bar_height + 2 {
+    // Tab bar (padding + labels) lives inside the bordered area.
+    let tab_bar_height = 2u16; // 1 padding + 1 labels
+    if area.height < tab_bar_height + 3 {
         return;
     }
 
@@ -634,16 +699,18 @@ fn draw_info_tabs(frame: &mut Frame, area: Rect, app: &mut App) {
         area,
     );
     let outer_block = Block::default()
-        .borders(Borders::LEFT | Borders::RIGHT | Borders::BOTTOM)
+        .borders(Borders::ALL)
         .border_style(Style::default().fg(app.theme.panel_border).bg(app.theme.menu_bg));
+    frame.render_widget(outer_block.clone(), area);
+    let inner = outer_block.inner(area);
 
-    // Split area: tab bar (1 line) + content
+    // Split inner: tab bar (2 lines) + content body
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(tab_bar_height), Constraint::Min(1)])
-        .split(area);
+        .split(inner);
 
-    // --- Tab bar ---
+    // --- Tab bar (padding line + label line) ---
     let tab_area = chunks[0];
     let tab_base = Style::default().fg(app.theme.bar_fg).bg(app.theme.bar_bg);
     let tab_active = Style::default()
@@ -651,12 +718,21 @@ fn draw_info_tabs(frame: &mut Frame, area: Rect, app: &mut App) {
         .bg(app.theme.active_bg)
         .add_modifier(Modifier::BOLD);
 
+    // The actual tab labels sit on the second line
+    let label_area = Rect {
+        y: tab_area.y + 1,
+        height: 1,
+        ..tab_area
+    };
+
     let mut spans = Vec::new();
+    let mut pad_spans = Vec::new();
     let mut tab_regions = Vec::new();
-    let mut cursor_x = tab_area.x;
+    let mut cursor_x = label_area.x;
     for (idx, tab) in InfoTab::ALL.iter().enumerate() {
         if idx > 0 {
             spans.push(Span::styled(" ", tab_base));
+            pad_spans.push(Span::styled(" ", tab_base));
             cursor_x += 1;
         }
         let style = if app.info_tab == *tab {
@@ -666,22 +742,32 @@ fn draw_info_tabs(frame: &mut Frame, area: Rect, app: &mut App) {
         };
         let label = format!(" {}.{} ", idx + 1, tab.label());
         let label_len = label.chars().count() as u16;
-        tab_regions.push((*tab, cursor_x, tab_area.y, label_len, 1));
+        // Padding line mirrors the style of each tab label (no bold for padding)
+        let pad_style = if app.info_tab == *tab {
+            Style::default().fg(app.theme.active_fg).bg(app.theme.active_bg)
+        } else {
+            tab_base
+        };
+        pad_spans.push(Span::styled(" ".repeat(label_len as usize), pad_style));
+        // Make click region cover both the padding line and the label line
+        tab_regions.push((*tab, cursor_x, tab_area.y, label_len, 2));
         spans.push(Span::styled(label, style));
         cursor_x += label_len;
     }
     let tab_used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
-    let tab_width = usize::from(tab_area.width);
+    let tab_width = usize::from(label_area.width);
     if tab_used < tab_width {
         spans.push(Span::styled(" ".repeat(tab_width - tab_used), tab_base));
+        pad_spans.push(Span::styled(" ".repeat(tab_width - tab_used), tab_base));
     }
-    frame.render_widget(Paragraph::new(Line::from(spans)), tab_area);
+    // Render padding line with styles matching the tab labels below
+    let pad_area = Rect { height: 1, ..tab_area };
+    frame.render_widget(Paragraph::new(Line::from(pad_spans)), pad_area);
+    frame.render_widget(Paragraph::new(Line::from(spans)), label_area);
     app.set_info_tab_regions(tab_regions);
 
     // --- Content area ---
-    let content_area = chunks[1];
-    frame.render_widget(outer_block.clone(), content_area);
-    let content_inner = outer_block.inner(content_area);
+    let content_inner = chunks[1];
     let inner_width = usize::from(content_inner.width);
     let inner_height = usize::from(content_inner.height);
 
@@ -730,29 +816,156 @@ fn draw_info_tabs(frame: &mut Frame, area: Rect, app: &mut App) {
 // Search overlay
 // ---------------------------------------------------------------------------
 
-fn draw_search_overlay(frame: &mut Frame, area: Rect, app: &App) {
-    let Some(state) = app.search_state.as_ref() else {
+fn draw_search_overlay(frame: &mut Frame, area: Rect, app: &mut App) {
+    if app.search_state.is_none() {
         return;
-    };
+    }
 
-    match state.mode {
-        SearchMode::Input => {
-            // Draw search input bar at the bottom of the screen
-            if area.height < 3 {
+    let mode = app.search_state.as_ref().unwrap().mode.clone();
+
+    match mode {
+        SearchMode::Scope => {
+            let options = app.search_scope_options();
+            if area.width < 30 || area.height < 8 {
                 return;
             }
-            let bar_rect = Rect::new(area.x, area.y + area.height.saturating_sub(2), area.width, 1);
-            let prompt = format!(" Search: {}", state.input);
-            let style = Style::default()
+
+            let content_width = options
+                .iter()
+                .map(|(_, label): &(SearchScope, String)| label.chars().count() + 4)
+                .max()
+                .unwrap_or(20);
+            let width = cmp::min(
+                cmp::max(content_width as u16 + 4, 30),
+                area.width.saturating_sub(4),
+            );
+            let height = cmp::min(options.len() as u16 + 4, area.height.saturating_sub(2));
+            let rect = Rect::new(
+                area.x + (area.width.saturating_sub(width)) / 2,
+                area.y + (area.height.saturating_sub(height)) / 2,
+                width,
+                height,
+            );
+
+            let block = Block::default()
+                .title(" Search Scope (Enter: select, Esc: cancel) ")
+                .borders(Borders::ALL)
+                .border_style(
+                    Style::default()
+                        .fg(app.theme.panel_border)
+                        .bg(app.theme.menu_bg),
+                );
+            frame.render_widget(Clear, rect);
+            frame.render_widget(block.clone(), rect);
+            let inner = block.inner(rect);
+            let inner_width = usize::from(inner.width);
+            let inner_height = usize::from(inner.height);
+
+            let state = app.search_state.as_ref().unwrap();
+            let scope_selected = state.scope_selected;
+
+            // Compute scroll so selected item is visible
+            let visible_start = if scope_selected >= state.scope_scroll + inner_height {
+                scope_selected - inner_height + 1
+            } else if scope_selected < state.scope_scroll {
+                scope_selected
+            } else {
+                state.scope_scroll
+            };
+
+            // Store scroll and inner rect for mouse handling
+            if let Some(state) = app.search_state.as_mut() {
+                state.scope_scroll = visible_start;
+                state.scope_inner_rect = Some((inner.x, inner.y, inner.width, inner.height));
+            }
+
+            let normal_style = Style::default().fg(app.theme.menu_fg).bg(app.theme.menu_bg);
+            let selected_style = Style::default()
                 .fg(app.theme.active_fg)
                 .bg(app.theme.active_bg);
-            frame.render_widget(Clear, bar_rect);
-            frame.render_widget(
-                Paragraph::new(clip_or_pad(&prompt, usize::from(area.width))).style(style),
-                bar_rect,
+
+            let mut lines: Vec<Line> = options
+                .iter()
+                .enumerate()
+                .skip(visible_start)
+                .take(inner_height)
+                .map(|(idx, (_, label))| {
+                    let style = if idx == scope_selected {
+                        selected_style
+                    } else {
+                        normal_style
+                    };
+                    Line::styled(clip_or_pad(&format!(" {label}"), inner_width), style)
+                })
+                .collect();
+
+            while lines.len() < inner_height {
+                lines.push(Line::styled(
+                    " ".repeat(inner_width),
+                    Style::default().bg(app.theme.menu_bg),
+                ));
+            }
+
+            frame.render_widget(Paragraph::new(lines), inner);
+        }
+        SearchMode::Input => {
+            let state = app.search_state.as_ref().unwrap();
+            if area.width < 30 || area.height < 7 {
+                return;
+            }
+            let scope_label = match &state.scope {
+                SearchScope::Global => "All columns".to_string(),
+                SearchScope::Column(_, name) => format!("Column: {name}"),
+            };
+
+            let width = cmp::min(76, area.width.saturating_sub(4));
+            let height = 7;
+            let rect = Rect::new(
+                area.x + (area.width.saturating_sub(width)) / 2,
+                area.y + (area.height.saturating_sub(height)) / 2,
+                width,
+                height,
             );
+
+            let block = Block::default()
+                .title(" Search ")
+                .borders(Borders::ALL)
+                .border_style(
+                    Style::default()
+                        .fg(app.theme.panel_border)
+                        .bg(app.theme.menu_bg),
+                );
+            frame.render_widget(Clear, rect);
+            frame.render_widget(block.clone(), rect);
+            let inner = block.inner(rect);
+            let inner_width = usize::from(inner.width);
+
+            let label_style = Style::default().fg(app.theme.menu_fg).bg(app.theme.menu_bg);
+            let input_style = Style::default().fg(app.theme.fg).bg(app.theme.line_bg);
+            let hint_style = Style::default().fg(app.theme.dim_fg).bg(app.theme.menu_bg);
+
+            let lines = vec![
+                Line::styled(
+                    clip_or_pad(&format!(" Scope: {scope_label}"), inner_width),
+                    label_style,
+                ),
+                Line::styled(
+                    clip_or_pad(" Query:", inner_width),
+                    label_style,
+                ),
+                Line::styled(
+                    clip_or_pad(&format!(" {}", state.input), inner_width),
+                    input_style,
+                ),
+                Line::styled(
+                    clip_or_pad(" Enter: search  Esc: back to scope", inner_width),
+                    hint_style,
+                ),
+            ];
+            frame.render_widget(Paragraph::new(lines), inner);
         }
         SearchMode::Results => {
+            let state = app.search_state.as_ref().unwrap();
             let Some(results) = state.results.as_ref() else {
                 return;
             };
@@ -770,7 +983,7 @@ fn draw_search_overlay(frame: &mut Frame, area: Rect, app: &App) {
             );
 
             let title = format!(
-                " Search: '{}' - {} matches{} (Esc: close, /: new search, e: export) ",
+                " Search: '{}' - {} matches{} (Esc: close, /: new search, Ctrl+E: export) ",
                 results.query,
                 results.matching_rows.len(),
                 if results.capped { "+" } else { "" },
@@ -877,17 +1090,20 @@ fn draw_search_overlay(frame: &mut Frame, area: Rect, app: &App) {
 // Export popup
 // ---------------------------------------------------------------------------
 
-fn draw_export_popup(frame: &mut Frame, area: Rect, app: &App) {
-    let Some(popup) = app.export_popup.as_ref() else {
+fn draw_export_popup(frame: &mut Frame, area: Rect, app: &mut App) {
+    if app.export_popup.is_none() {
         return;
-    };
+    }
 
-    if area.width < 30 || area.height < 7 {
+    let has_error = app.export_popup.as_ref().is_some_and(|p| p.error.is_some());
+    let base_height: u16 = if has_error { 9 } else { 8 };
+
+    if area.width < 30 || area.height < base_height {
         return;
     }
 
     let width = cmp::min(76, area.width.saturating_sub(4));
-    let height = 7;
+    let height = base_height;
     let rect = Rect::new(
         (area.width.saturating_sub(width)) / 2,
         (area.height.saturating_sub(height)) / 2,
@@ -895,7 +1111,15 @@ fn draw_export_popup(frame: &mut Frame, area: Rect, app: &App) {
         height,
     );
 
+    // Store rect for mouse click-outside detection
+    if let Some(popup) = app.export_popup.as_mut() {
+        popup.rect = Some((rect.x, rect.y, rect.width, rect.height));
+    }
+
+    let popup = app.export_popup.as_ref().unwrap();
     let inner_width = usize::from(width.saturating_sub(2));
+
+    let source_label = format!(" Source: {}", app.display_path(&popup.source));
 
     let filter_note = if app
         .search_state
@@ -903,32 +1127,67 @@ fn draw_export_popup(frame: &mut Frame, area: Rect, app: &App) {
         .and_then(|s| s.results.as_ref())
         .is_some()
     {
-        " (will export filtered rows only)"
+        " (filtered rows only)"
     } else {
-        " (will export all rows)"
+        " (all rows)"
     };
 
-    let lines = vec![
+    let label_style = Style::default().fg(app.theme.menu_fg).bg(app.theme.menu_bg);
+    let input_style = Style::default().fg(app.theme.fg).bg(app.theme.line_bg);
+    let cursor_style = Style::default()
+        .fg(app.theme.active_fg)
+        .bg(app.theme.active_bg);
+    let hint_style = Style::default().fg(app.theme.dim_fg).bg(app.theme.menu_bg);
+
+    let input = &popup.input;
+    let cursor = popup.cursor;
+    let before: String = input.chars().take(cursor).collect();
+    let cursor_char = input.chars().nth(cursor).unwrap_or(' ');
+    let after: String = input.chars().skip(cursor + 1).collect();
+    let after_pad_len = inner_width
+        .saturating_sub(1)
+        .saturating_sub(UnicodeWidthStr::width(before.as_str()))
+        .saturating_sub(UnicodeWidthChar::width(cursor_char).unwrap_or(1))
+        .saturating_sub(UnicodeWidthStr::width(after.as_str()));
+    let after_padded = format!("{after}{}", " ".repeat(after_pad_len));
+
+    let input_line = Line::from(vec![
+        Span::styled(" ", input_style),
+        Span::styled(before, input_style),
+        Span::styled(cursor_char.to_string(), cursor_style),
+        Span::styled(after_padded, input_style),
+    ]);
+
+    let error_style = Style::default().fg(app.theme.active_fg).bg(app.theme.menu_bg);
+
+    let mut lines = vec![
         Line::styled(
-            clip_or_pad(&format!(" Export to:{filter_note}"), inner_width),
-            Style::default().fg(app.theme.menu_fg).bg(app.theme.menu_bg),
+            clip_or_pad(&source_label, inner_width),
+            label_style,
         ),
         Line::styled(
-            clip_or_pad(" Path:", inner_width),
-            Style::default().fg(app.theme.menu_fg).bg(app.theme.menu_bg),
+            clip_or_pad(&format!(" Export to CSV{filter_note}:"), inner_width),
+            label_style,
         ),
         Line::styled(
-            clip_or_pad(&popup.input, inner_width),
-            Style::default().fg(app.theme.fg).bg(app.theme.line_bg),
+            clip_or_pad(" Target:", inner_width),
+            label_style,
         ),
-        Line::styled(
-            clip_or_pad(" Enter: export  Esc: cancel", inner_width),
-            Style::default().fg(app.theme.dim_fg).bg(app.theme.menu_bg),
-        ),
+        input_line,
     ];
+    if let Some(err) = &popup.error {
+        lines.push(Line::styled(
+            clip_or_pad(&format!(" {err}"), inner_width),
+            error_style,
+        ));
+    }
+    lines.push(Line::styled(
+        clip_or_pad(" Enter: export  Esc: cancel", inner_width),
+        hint_style,
+    ));
 
     let block = Block::default()
-        .title(" Export Parquet ")
+        .title(" Export to CSV ")
         .borders(Borders::ALL)
         .border_style(
             Style::default()
@@ -942,27 +1201,157 @@ fn draw_export_popup(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 // ---------------------------------------------------------------------------
-// Info popup (Keybindings / About)
+// Import popup
 // ---------------------------------------------------------------------------
 
-fn draw_info_popup(frame: &mut Frame, area: Rect, app: &App) {
-    let Some(popup) = app.info_popup.as_ref() else {
-        return;
-    };
-
-    if area.width < 30 || area.height < 10 {
+fn draw_import_popup(frame: &mut Frame, area: Rect, app: &mut App) {
+    if app.import_popup.is_none() {
         return;
     }
 
-    let content_width = popup
-        .lines
-        .iter()
-        .map(|l| l.chars().count())
-        .max()
-        .unwrap_or(20);
+    let has_error = app.import_popup.as_ref().is_some_and(|p| p.error.is_some());
+    let base_height: u16 = if has_error { 10 } else { 9 };
+
+    if area.width < 30 || area.height < base_height {
+        return;
+    }
+
+    let width = cmp::min(76, area.width.saturating_sub(4));
+    let height = base_height;
+    let rect = Rect::new(
+        (area.width.saturating_sub(width)) / 2,
+        (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    );
+
+    // Store rect for mouse click-outside detection
+    if let Some(popup) = app.import_popup.as_mut() {
+        popup.rect = Some((rect.x, rect.y, rect.width, rect.height));
+    }
+
+    let popup = app.import_popup.as_ref().unwrap();
+    let inner_width = usize::from(width.saturating_sub(2));
+
+    let label_style = Style::default().fg(app.theme.menu_fg).bg(app.theme.menu_bg);
+    let input_style = Style::default().fg(app.theme.fg).bg(app.theme.line_bg);
+    let inactive_input_style = Style::default().fg(app.theme.dim_fg).bg(app.theme.line_bg);
+    let cursor_style = Style::default()
+        .fg(app.theme.active_fg)
+        .bg(app.theme.active_bg);
+    let hint_style = Style::default().fg(app.theme.dim_fg).bg(app.theme.menu_bg);
+
+    // Source field
+    let src_active = popup.active_field == ImportField::Source;
+    let src_line = build_input_line(
+        &popup.input,
+        popup.cursor,
+        inner_width,
+        if src_active { input_style } else { inactive_input_style },
+        if src_active { cursor_style } else { inactive_input_style },
+    );
+
+    // Target field
+    let tgt_active = popup.active_field == ImportField::Target;
+    let tgt_line = build_input_line(
+        &popup.target,
+        popup.target_cursor,
+        inner_width,
+        if tgt_active { input_style } else { inactive_input_style },
+        if tgt_active { cursor_style } else { inactive_input_style },
+    );
+
+    let active_marker = |field: ImportField| -> &str {
+        if popup.active_field == field { " ▶" } else { "  " }
+    };
+
+    let error_style = Style::default().fg(app.theme.active_fg).bg(app.theme.menu_bg);
+
+    let mut lines = vec![
+        Line::styled(
+            clip_or_pad(&format!("{} Source CSV:", active_marker(ImportField::Source)), inner_width),
+            label_style,
+        ),
+        src_line,
+        Line::styled(
+            clip_or_pad(&format!("{} Target Parquet:", active_marker(ImportField::Target)), inner_width),
+            label_style,
+        ),
+        tgt_line,
+    ];
+    if let Some(err) = &popup.error {
+        lines.push(Line::styled(
+            clip_or_pad(&format!(" {err}"), inner_width),
+            error_style,
+        ));
+    } else {
+        lines.push(Line::styled(
+            clip_or_pad("", inner_width),
+            Style::default().bg(app.theme.menu_bg),
+        ));
+    }
+    lines.push(Line::styled(
+        clip_or_pad(" Enter: import  Tab: switch field  Esc: cancel", inner_width),
+        hint_style,
+    ));
+
+    let block = Block::default()
+        .title(" Import from CSV ")
+        .borders(Borders::ALL)
+        .border_style(
+            Style::default()
+                .fg(app.theme.panel_border)
+                .bg(app.theme.menu_bg),
+        );
+
+    frame.render_widget(Clear, rect);
+    frame.render_widget(block.clone(), rect);
+    frame.render_widget(Paragraph::new(lines), block.inner(rect));
+}
+
+fn build_input_line(
+    input: &str,
+    cursor: usize,
+    width: usize,
+    input_style: Style,
+    cursor_style: Style,
+) -> Line<'static> {
+    let before: String = input.chars().take(cursor).collect();
+    let cursor_char = input.chars().nth(cursor).unwrap_or(' ');
+    let after: String = input.chars().skip(cursor + 1).collect();
+    let after_pad_len = width
+        .saturating_sub(1)
+        .saturating_sub(UnicodeWidthStr::width(before.as_str()))
+        .saturating_sub(UnicodeWidthChar::width(cursor_char).unwrap_or(1))
+        .saturating_sub(UnicodeWidthStr::width(after.as_str()));
+    let after_padded = format!("{after}{}", " ".repeat(after_pad_len));
+
+    Line::from(vec![
+        Span::styled(" ", input_style),
+        Span::styled(before, input_style),
+        Span::styled(cursor_char.to_string(), cursor_style),
+        Span::styled(after_padded, input_style),
+    ])
+}
+
+// ---------------------------------------------------------------------------
+// Info popup (Keybindings / About)
+// ---------------------------------------------------------------------------
+
+fn draw_info_popup(frame: &mut Frame, area: Rect, app: &mut App) {
+    if app.info_popup.is_none() || area.width < 30 || area.height < 10 {
+        return;
+    }
+
+    // Compute rect from copied values to avoid borrow issues
+    let (content_width, line_count) = {
+        let popup = app.info_popup.as_ref().unwrap();
+        let cw = popup.lines.iter().map(|l| l.chars().count()).max().unwrap_or(20);
+        (cw, popup.lines.len())
+    };
 
     let width = cmp::min(cmp::max(content_width as u16 + 6, 40), area.width.saturating_sub(4));
-    let height = cmp::min(popup.lines.len() as u16 + 4, area.height.saturating_sub(2));
+    let height = cmp::min(line_count as u16 + 4, area.height.saturating_sub(2));
     let rect = Rect::new(
         area.x + (area.width.saturating_sub(width)) / 2,
         area.y + (area.height.saturating_sub(height)) / 2,
@@ -970,6 +1359,10 @@ fn draw_info_popup(frame: &mut Frame, area: Rect, app: &App) {
         height,
     );
 
+    // Store rect so mouse clicks outside can close the popup
+    app.info_popup.as_mut().unwrap().rect = Some((rect.x, rect.y, rect.width, rect.height));
+
+    let popup = app.info_popup.as_ref().unwrap();
     let title = format!(" {} ", popup.title);
     let block = Block::default()
         .title(title.as_str())
@@ -1034,17 +1427,92 @@ fn compute_cell_width(total_width: usize, visible_cols: usize) -> usize {
 
 fn format_table_row(index: Option<String>, cells: Vec<String>) -> String {
     let index_text = index.unwrap_or_default();
+    // Right-align the index in a 5-display-width column
+    let idx_w = UnicodeWidthStr::width(index_text.as_str());
+    let padded_idx = if idx_w < 5 {
+        format!("{}{}", " ".repeat(5 - idx_w), index_text)
+    } else {
+        index_text
+    };
     if cells.is_empty() {
-        return format!("{:>5}", index_text);
+        return padded_idx;
     }
-    format!("{:>5} | {}", index_text, cells.join(" | "))
+    format!("{} | {}", padded_idx, cells.join(" | "))
 }
 
+/// Clip or pad a string to exactly `width` display columns.
+/// Replaces control characters and tabs with spaces to avoid alignment issues.
 fn clip_or_pad(text: &str, width: usize) -> String {
-    let mut out = text.chars().take(width).collect::<String>();
-    let used = out.chars().count();
+    let mut out = String::new();
+    let mut used = 0;
+    for ch in text.chars() {
+        // Replace control chars / tabs with a space
+        let ch = if ch.is_control() { ' ' } else { ch };
+        let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + cw > width {
+            break;
+        }
+        out.push(ch);
+        used += cw;
+    }
     if used < width {
         out.push_str(&" ".repeat(width - used));
     }
     out
+}
+
+fn draw_progress_popup(frame: &mut Frame, area: Rect, app: &mut App) {
+    let Some(progress) = &app.progress_popup else {
+        return;
+    };
+
+    let width = 50u16.min(area.width.saturating_sub(4));
+    let height = 5u16;
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let popup_area = Rect::new(x, y, width, height);
+
+    frame.render_widget(Clear, popup_area);
+
+    let title = format!(" {} ", progress.title);
+    let block = Block::default()
+        .title(title.as_str())
+        .title_style(Style::default().fg(app.theme.fg).bg(app.theme.bg).add_modifier(Modifier::BOLD))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(app.theme.panel_border).bg(app.theme.bg));
+    frame.render_widget(block.clone(), popup_area);
+    let inner = block.inner(popup_area);
+
+    let spinner = app.progress_spinner();
+    let (line1, line2) = if let Some(done_msg) = &progress.done_message {
+        (
+            format!("{spinner} {done_msg}"),
+            String::new(),
+        )
+    } else {
+        let elapsed = progress.started.elapsed().as_secs();
+        (
+            format!("{spinner} {}", progress.message),
+            format!("  Elapsed: {elapsed}s"),
+        )
+    };
+
+    let is_done = progress.done_message.is_some();
+    let fg = if is_done { app.theme.active_fg } else { app.theme.fg };
+
+    let lines = vec![
+        Line::styled(
+            clip_or_pad(&line1, usize::from(inner.width)),
+            Style::default().fg(fg).bg(app.theme.bg),
+        ),
+        Line::styled(
+            clip_or_pad(&line2, usize::from(inner.width)),
+            Style::default().fg(app.theme.dim_fg).bg(app.theme.bg),
+        ),
+    ];
+
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(app.theme.bg)),
+        inner,
+    );
 }

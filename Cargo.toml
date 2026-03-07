@@ -7,6 +7,7 @@ edition = "2024"
 anyhow = "1.0"
 crossterm = "0.29"
 parquet = "58.0.0"
-polars = { version = "0.51", default-features = false, features = ["parquet", "fmt"] }
+polars = { version = "0.51", default-features = false, features = ["parquet", "csv", "fmt"] }
 ratatui = "0.29"
+unicode-width = "0.2"
 walkdir = "2.5"
