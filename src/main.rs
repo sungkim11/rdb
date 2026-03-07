@@ -2,6 +2,7 @@ use std::env;
 use std::io;
 use std::time::Duration;
 
+use crate::app::LeftTab;
 use anyhow::Context;
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
@@ -16,6 +17,7 @@ use ratatui::backend::CrosstermBackend;
 mod app;
 mod duckdb;
 mod parquet;
+mod postgres;
 mod theme;
 mod ui;
 
@@ -97,6 +99,12 @@ fn run_app(
                     continue;
                 }
 
+                if app.pg_connect_popup.is_some() {
+                    let result = app.handle_pg_connect_key(key);
+                    app.apply_result(result.map(|_| ()));
+                    continue;
+                }
+
                 if app.search_state.is_some() {
                     let result = app.handle_search_key(key);
                     app.apply_result(result.map(|_| ()));
@@ -159,12 +167,28 @@ fn run_app(
                     KeyCode::Tab => app.toggle_focus(),
                     KeyCode::Enter => {
                         if app.active_pane == ActivePane::Files {
-                            let result = app.load_selected();
-                            app.apply_result(result);
+                            match app.left_tab {
+                                LeftTab::Postgres => {
+                                    app.pg_tree_toggle_or_select();
+                                }
+                                LeftTab::Connections => {
+                                    app.conn_activate_selected();
+                                }
+                                LeftTab::Files => {
+                                    let result = app.load_selected();
+                                    app.apply_result(result);
+                                }
+                            }
                         }
                     }
                     KeyCode::Up => match app.active_pane {
-                        ActivePane::Files => app.move_selection(-1),
+                        ActivePane::Files => match app.left_tab {
+                            LeftTab::Postgres => {
+                                app.pg_tree_move_selection(-1);
+                            }
+                            LeftTab::Connections => app.conn_move_selection(-1),
+                            LeftTab::Files => app.move_selection(-1),
+                        },
                         ActivePane::Preview => {
                             if key.modifiers.contains(KeyModifiers::SHIFT) {
                                 app.scroll_info_panel(-1);
@@ -175,7 +199,13 @@ fn run_app(
                         }
                     },
                     KeyCode::Down => match app.active_pane {
-                        ActivePane::Files => app.move_selection(1),
+                        ActivePane::Files => match app.left_tab {
+                            LeftTab::Postgres => {
+                                app.pg_tree_move_selection(1);
+                            }
+                            LeftTab::Connections => app.conn_move_selection(1),
+                            LeftTab::Files => app.move_selection(1),
+                        },
                         ActivePane::Preview => {
                             if key.modifiers.contains(KeyModifiers::SHIFT) {
                                 app.scroll_info_panel(1);
@@ -222,8 +252,15 @@ fn run_app(
                         ActivePane::Files => app.expand_selected_directory(),
                     },
                     KeyCode::Backspace => {
-                        if app.active_pane == ActivePane::Files {
+                        if app.active_pane == ActivePane::Files && app.left_tab == LeftTab::Files {
                             app.collapse_selected_directory_or_parent();
+                        }
+                    }
+                    KeyCode::Delete => {
+                        if app.active_pane == ActivePane::Files
+                            && app.left_tab == LeftTab::Connections
+                        {
+                            app.conn_delete_selected();
                         }
                     }
                     // Import
