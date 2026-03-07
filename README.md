@@ -3,7 +3,7 @@
 `rdb` is a terminal data explorer built with Rust + Ratatui + Polars + DuckDB + PostgreSQL.
 It provides a multi-pane TUI with a file explorer, Parquet/CSV data preview, PostgreSQL database browser, sorting, search, SQL query pane (DuckDB for local files, PostgreSQL when connected), info tabs, import/export, menu bar, and popup-driven workflows.
 
-Built by [sungkim11](https://github.com/sungkim11).
+Built by [Sung Kim](https://github.com/sungkim11).
 
 ## Current Features
 
