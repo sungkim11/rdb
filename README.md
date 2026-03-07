@@ -1,18 +1,31 @@
 # rdb
 
-`rdb` is a terminal data explorer built with Rust + Ratatui + Polars + DuckDB.
-It provides a multi-pane TUI with a file explorer, Parquet/CSV data preview with sorting and search, a SQL query pane powered by DuckDB, info tabs (schema, statistics, metadata), import/export, menu bar, and popup-driven workflows.
+`rdb` is a terminal data explorer built with Rust + Ratatui + Polars + DuckDB + PostgreSQL.
+It provides a multi-pane TUI with a file explorer, Parquet/CSV data preview, PostgreSQL database browser, sorting, search, SQL query pane (DuckDB for local files, PostgreSQL when connected), info tabs, import/export, menu bar, and popup-driven workflows.
 
 Built by [sungkim11](https://github.com/sungkim11).
 
 ## Current Features
 
 - Top menus: `File`, `SQL`, `Tools`, `Help`
-- File explorer pane (left):
-  - Tree view for directories/files
-  - Expand/collapse directories
-  - Double-click support for open/toggle
-  - File type filtering (Parquet, CSV, or all)
+- Tabbed left navigation:
+  - **Files** tab: tree view for directories/files (Parquet, CSV)
+    - Expand/collapse directories
+    - Double-click support for open/toggle
+    - File type filtering (Parquet, CSV, or all)
+  - **Connections** tab: saved PostgreSQL connections
+    - Add, select, and delete connections
+    - Connections persisted to `~/.config/rdb/connections.json`
+  - **Postgres** tab (replaces Connections when connected): database tree browser
+    - Schema → table hierarchy with expand/collapse
+    - Select a table to load its data in the preview pane
+- PostgreSQL support:
+  - Connection popup with labeled fields (Name, Host, Port, User, Password, Database) and editable URI
+  - Threaded connection with 5-second timeout
+  - Browse database schemas and tables
+  - Preview table data with column sorting
+  - Run SQL queries against PostgreSQL via the SQL pane
+  - `[PG]` indicator in menu bar when connected
 - Data preview pane (right):
   - Row table with frozen header
   - Horizontal column scrolling
@@ -21,11 +34,12 @@ Built by [sungkim11](https://github.com/sungkim11).
 - SQL pane (right, replaces preview):
   - `SQL | Open SQL Pane` or `Ctrl+D` to toggle
   - Multi-line SQL editor with line numbers
-  - The loaded file is exposed as a `data` table
+  - `F5` to run query
+  - Local files: queries run against DuckDB (loaded file exposed as `data` table)
+  - PostgreSQL: queries run against the connected database
   - Results displayed in a scrollable table with column navigation
-  - Powered by DuckDB (in-memory)
 - Info tabs:
-  - Schema, Statistics, Metadata tabs below preview
+  - Schema, Statistics, Metadata tabs below preview (Parquet only)
   - Prettified popup views
 - Search:
   - `Tools | Search` popup for searching within loaded data
@@ -128,12 +142,22 @@ Then build with `--target`:
 cargo build --release --target x86_64-pc-windows-gnu
 ```
 
+PostgreSQL:
+
+- `SQL | Connect to PostgreSQL`: open connection popup
+- `SQL | Disconnect PostgreSQL`: disconnect from database
+- `Delete`: remove saved connection (in Connections tab)
+
 ## Runtime Data
 
 Settings (palette, recent files) are stored in:
 
 - `$XDG_CONFIG_HOME/rdb/settings.conf` (if `XDG_CONFIG_HOME` is set), or
 - `~/.config/rdb/settings.conf`
+
+Saved PostgreSQL connections are stored in:
+
+- `~/.config/rdb/connections.json`
 
 ## Keybindings
 
@@ -154,10 +178,10 @@ Data:
 - Click header: sort by clicked column
 - `/`: search in loaded data
 
-SQL (DuckDB):
+SQL (DuckDB / PostgreSQL):
 
 - `Ctrl+D`: toggle SQL pane
-- `Ctrl+Enter`: run SQL query
+- `F5`: run SQL query
 - `Shift+Up/Down`: scroll results
 - `Shift+Left/Right`: scroll result columns
 
@@ -207,7 +231,8 @@ cargo run -- data/sample.parquet
 Then try:
 
 1. `Tools | Palette`
-2. `Ctrl+D` to open SQL pane, then `SELECT count(*) FROM data`
+2. `Ctrl+D` to open SQL pane, then `SELECT count(*) FROM data`, press `F5`
 3. `Tools | Search`
 4. `File | Export to CSV`
-5. `Help | Keybindings`
+5. `SQL | Connect to PostgreSQL` to browse a database
+6. `Help | Keybindings`
