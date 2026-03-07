@@ -373,6 +373,7 @@ const MAX_SEARCH_RESULTS: usize = 10_000;
 pub fn search_parquet_rows(
     path: &Path,
     query: &str,
+    col_index: Option<usize>,
     cell_char_limit: usize,
 ) -> anyhow::Result<SearchResults> {
     let file =
@@ -393,13 +394,19 @@ pub fn search_parquet_rows(
         let mut matched = false;
         let mut cells = Vec::with_capacity(columns.len());
 
-        for series in columns {
+        for (ci, series) in columns.iter().enumerate() {
             let cell_str = match series.get(row_idx) {
                 Ok(value) => clip_value(&value.to_string(), cell_char_limit),
                 Err(_) => "<err>".to_string(),
             };
-            if !matched && cell_str.to_lowercase().contains(&query_lower) {
-                matched = true;
+            if !matched {
+                let search_this = match col_index {
+                    Some(target_col) => ci == target_col,
+                    None => true,
+                };
+                if search_this && cell_str.to_lowercase().contains(&query_lower) {
+                    matched = true;
+                }
             }
             cells.push(cell_str);
         }
@@ -422,10 +429,209 @@ pub fn search_parquet_rows(
 }
 
 // ---------------------------------------------------------------------------
-// Export / write parquet
+// CSV viewing functions
 // ---------------------------------------------------------------------------
 
-pub fn export_parquet(
+fn read_csv_dataframe(path: &Path) -> anyhow::Result<DataFrame> {
+    let file =
+        File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+    CsvReader::new(file)
+        .finish()
+        .with_context(|| format!("failed to read CSV from {}", path.display()))
+}
+
+pub fn load_csv_meta(path: &Path) -> anyhow::Result<ParquetMeta> {
+    let df = read_csv_dataframe(path)?;
+    let mut schema_lines = Vec::with_capacity(df.width());
+    for col in df.get_columns() {
+        schema_lines.push(format!("{}: {:?}", col.name(), col.dtype()));
+    }
+    Ok(ParquetMeta {
+        total_rows: df.height(),
+        total_cols: df.width(),
+        schema_lines,
+    })
+}
+
+pub fn load_csv_slice(
+    path: &Path,
+    row_start: usize,
+    row_count: usize,
+    projection: &[usize],
+    cell_char_limit: usize,
+) -> anyhow::Result<ParquetSlice> {
+    if projection.is_empty() {
+        return Ok(ParquetSlice {
+            row_start,
+            col_start: 0,
+            column_names: Vec::new(),
+            rows: Vec::new(),
+        });
+    }
+
+    let df = read_csv_dataframe(path)?;
+    let sliced = df.slice(row_start as i64, row_count);
+
+    // Select only projected columns
+    let all_cols = sliced.get_columns();
+    let mut rows = Vec::with_capacity(sliced.height());
+    let mut column_names = Vec::with_capacity(projection.len());
+    let projected_cols: Vec<_> = projection.iter().filter_map(|&i| all_cols.get(i)).collect();
+
+    for col in &projected_cols {
+        column_names.push(col.name().to_string());
+    }
+
+    for row_idx in 0..sliced.height() {
+        let row = projected_cols
+            .iter()
+            .map(|series| match series.get(row_idx) {
+                Ok(value) => clip_value(&value.to_string(), cell_char_limit),
+                Err(_) => "<err>".to_string(),
+            })
+            .collect();
+        rows.push(row);
+    }
+
+    Ok(ParquetSlice {
+        row_start,
+        col_start: *projection.first().unwrap_or(&0),
+        column_names,
+        rows,
+    })
+}
+
+pub fn load_csv_rows(
+    path: &Path,
+    row_indices: &[usize],
+    projection: &[usize],
+    cell_char_limit: usize,
+) -> anyhow::Result<ParquetSlice> {
+    if projection.is_empty() || row_indices.is_empty() {
+        return Ok(ParquetSlice {
+            row_start: 0,
+            col_start: 0,
+            column_names: Vec::new(),
+            rows: Vec::new(),
+        });
+    }
+
+    let df = read_csv_dataframe(path)?;
+
+    // Select projected columns
+    let col_names: Vec<_> = projection
+        .iter()
+        .filter_map(|&i| df.get_columns().get(i).map(|c| c.name().clone()))
+        .collect();
+    let projected = df
+        .select(col_names)
+        .with_context(|| "failed to select columns for CSV view")?;
+
+    let idx_vec: Vec<IdxSize> = row_indices.iter().map(|&i| i as IdxSize).collect();
+    let idx = IdxCa::new("idx".into(), &idx_vec);
+    let sliced = projected
+        .take(&idx)
+        .with_context(|| "failed to select rows for sorted CSV view")?;
+
+    let columns = sliced.get_columns();
+    let mut rows = Vec::with_capacity(sliced.height());
+
+    for row_idx in 0..sliced.height() {
+        let row = columns
+            .iter()
+            .map(|series| match series.get(row_idx) {
+                Ok(value) => clip_value(&value.to_string(), cell_char_limit),
+                Err(_) => "<err>".to_string(),
+            })
+            .collect();
+        rows.push(row);
+    }
+
+    Ok(ParquetSlice {
+        row_start: 0,
+        col_start: *projection.first().unwrap_or(&0),
+        column_names: columns
+            .iter()
+            .map(|series| series.name().to_string())
+            .collect(),
+        rows,
+    })
+}
+
+pub fn compute_csv_sort_indices(
+    path: &Path,
+    col_index: usize,
+    descending: bool,
+) -> anyhow::Result<Vec<usize>> {
+    let df = read_csv_dataframe(path)?;
+    let col = &df.get_columns()[col_index];
+    let options = SortOptions::default().with_order_descending(descending);
+    let sorted_idx = col.as_materialized_series().arg_sort(options);
+
+    Ok(sorted_idx
+        .into_no_null_iter()
+        .map(|i| i as usize)
+        .collect())
+}
+
+pub fn search_csv_rows(
+    path: &Path,
+    query: &str,
+    col_index: Option<usize>,
+    cell_char_limit: usize,
+) -> anyhow::Result<SearchResults> {
+    let df = read_csv_dataframe(path)?;
+    let columns = df.get_columns();
+    let column_names: Vec<String> = columns.iter().map(|s| s.name().to_string()).collect();
+    let query_lower = query.to_lowercase();
+    let total_rows = df.height();
+
+    let mut matching_rows = Vec::new();
+    let mut capped = false;
+
+    for row_idx in 0..total_rows {
+        let mut matched = false;
+        let mut cells = Vec::with_capacity(columns.len());
+
+        for (ci, series) in columns.iter().enumerate() {
+            let cell_str = match series.get(row_idx) {
+                Ok(value) => clip_value(&value.to_string(), cell_char_limit),
+                Err(_) => "<err>".to_string(),
+            };
+            if !matched {
+                let search_this = match col_index {
+                    Some(target_col) => ci == target_col,
+                    None => true,
+                };
+                if search_this && cell_str.to_lowercase().contains(&query_lower) {
+                    matched = true;
+                }
+            }
+            cells.push(cell_str);
+        }
+
+        if matched {
+            matching_rows.push((row_idx, cells));
+            if matching_rows.len() >= MAX_SEARCH_RESULTS {
+                capped = true;
+                break;
+            }
+        }
+    }
+
+    Ok(SearchResults {
+        query: query.to_string(),
+        column_names,
+        matching_rows,
+        capped,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Export / write CSV
+// ---------------------------------------------------------------------------
+
+pub fn export_csv(
     source: &Path,
     dest: &Path,
     row_indices: Option<&[usize]>,
@@ -454,8 +660,38 @@ pub fn export_parquet(
 
     let out_file =
         File::create(dest).with_context(|| format!("failed to create {}", dest.display()))?;
-    ParquetWriter::new(out_file)
+    CsvWriter::new(out_file)
         .finish(&mut out_df)
+        .with_context(|| format!("failed to write CSV to {}", dest.display()))?;
+
+    Ok(rows_written)
+}
+
+// ---------------------------------------------------------------------------
+// Import CSV → Parquet
+// ---------------------------------------------------------------------------
+
+pub fn import_csv(
+    source: &Path,
+    dest: &Path,
+) -> anyhow::Result<usize> {
+    let mut df = CsvReader::new(
+        File::open(source).with_context(|| format!("failed to open {}", source.display()))?,
+    )
+    .finish()
+    .with_context(|| format!("failed to read CSV from {}", source.display()))?;
+
+    let rows_written = df.height();
+
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create directory {}", parent.display()))?;
+    }
+
+    let out_file =
+        File::create(dest).with_context(|| format!("failed to create {}", dest.display()))?;
+    ParquetWriter::new(out_file)
+        .finish(&mut df)
         .with_context(|| format!("failed to write parquet to {}", dest.display()))?;
 
     Ok(rows_written)

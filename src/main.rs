@@ -18,7 +18,7 @@ mod parquet;
 mod theme;
 mod ui;
 
-use app::{ActivePane, App, FileActionKind};
+use app::{ActivePane, App};
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = env::args().collect();
@@ -60,6 +60,9 @@ fn run_app(
     loop {
         terminal.draw(|frame| ui::draw(frame, app))?;
 
+        // Poll background operations (export/import progress)
+        app.poll_progress();
+
         if !event::poll(Duration::from_millis(200))? {
             continue;
         }
@@ -67,6 +70,11 @@ fn run_app(
         match event::read()? {
             Event::Key(key) => {
                 if key.kind == KeyEventKind::Release {
+                    continue;
+                }
+
+                // Progress popup blocks all input
+                if app.progress_popup.is_some() {
                     continue;
                 }
 
@@ -78,6 +86,12 @@ fn run_app(
 
                 if app.export_popup.is_some() {
                     let result = app.handle_export_key(key);
+                    app.apply_result(result.map(|_| ()));
+                    continue;
+                }
+
+                if app.import_popup.is_some() {
+                    let result = app.handle_import_key(key);
                     app.apply_result(result.map(|_| ()));
                     continue;
                 }
@@ -122,7 +136,6 @@ fn run_app(
                     KeyCode::F(1) => {
                         app.open_keybindings_popup();
                     }
-                    KeyCode::Char('q') => break,
                     KeyCode::Char('r') => {
                         let result = app.rescan_files();
                         app.apply_result(result);
@@ -197,6 +210,12 @@ fn run_app(
                             app.collapse_selected_directory_or_parent();
                         }
                     }
+                    // Import
+                    KeyCode::Char('i')
+                        if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                    {
+                        app.open_import_popup();
+                    }
                     // Info tab keys
                     KeyCode::Char('i') => {
                         let result = app.switch_info_tab(app::InfoTab::Metadata);
@@ -221,30 +240,10 @@ fn run_app(
                     KeyCode::Char('/') => {
                         app.open_search();
                     }
-                    KeyCode::Char('e') => {
+                    KeyCode::Char('e')
+                        if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                    {
                         app.open_export_popup();
-                    }
-                    // Existing file ops (Files pane only)
-                    KeyCode::Char('n') => {
-                        if app.active_pane == ActivePane::Files {
-                            app.open_file_action(FileActionKind::Rename);
-                        }
-                    }
-                    KeyCode::Char('c') => {
-                        if app.active_pane == ActivePane::Files {
-                            app.open_file_action(FileActionKind::Copy);
-                        }
-                    }
-                    KeyCode::Char('m') => {
-                        if app.active_pane == ActivePane::Files {
-                            app.open_file_action(FileActionKind::Move);
-                        }
-                    }
-                    KeyCode::Char('d') => {
-                        if app.active_pane == ActivePane::Files {
-                            let result = app.arm_or_delete_selected();
-                            app.apply_result(result);
-                        }
                     }
                     KeyCode::Char('o') => {
                         if app.active_pane == ActivePane::Preview {
@@ -256,6 +255,9 @@ fn run_app(
                 }
             }
             Event::Mouse(mouse) => {
+                if app.progress_popup.is_some() {
+                    continue;
+                }
                 let (cols, rows) = size()?;
                 let result = app.handle_mouse_event(mouse, cols, rows);
                 app.apply_result(result);

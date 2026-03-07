@@ -3,12 +3,15 @@ use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::parquet::{
     ColumnStatistics, ParquetFileInfo, ParquetMeta, SearchResults, compute_column_statistics,
-    compute_sort_indices, export_parquet, fit_visible_columns, load_parquet_file_info,
-    load_parquet_meta, load_parquet_rows, load_parquet_slice, search_parquet_rows,
+    compute_csv_sort_indices, compute_sort_indices, export_csv, fit_visible_columns, import_csv,
+    load_csv_meta, load_csv_rows, load_csv_slice, load_parquet_file_info, load_parquet_meta,
+    load_parquet_rows, load_parquet_slice, search_csv_rows, search_parquet_rows,
 };
 use crate::theme::{PaletteTheme, Theme};
 use anyhow::Context;
@@ -79,23 +82,18 @@ impl OpenMenu {
     }
 }
 
-static FILE_MENU: [MenuEntry; 7] = [
-    entry("Rename", "n"),
-    entry("Copy", "c"),
-    entry("Move", "m"),
-    entry("Delete", "d"),
-    entry("Export", "e"),
+static FILE_MENU: [MenuEntry; 4] = [
+    entry("Import from CSV", "Ctrl+I"),
+    entry("Export to CSV", "Ctrl+E"),
     sep(),
-    entry("Quit", "q"),
+    entry("Quit", "Ctrl+Q"),
 ];
 
-static VIEW_MENU: [MenuEntry; 3] = [
-    entry("Metadata", "i"),
-    entry("Statistics", "s"),
+static VIEW_MENU: [MenuEntry; 0] = [];
+
+static TOOLS_MENU: [MenuEntry; 5] = [
     entry("Search", "/"),
-];
-
-static TOOLS_MENU: [MenuEntry; 3] = [
+    sep(),
     entry("Refresh", "r"),
     sep(),
     entry("Palette", "Ctrl+P"),
@@ -142,6 +140,7 @@ pub struct FileActionPopup {
     pub source: PathBuf,
     pub input: String,
     pub cursor: usize,
+    pub rect: Option<(u16, u16, u16, u16)>,
 }
 
 #[derive(Clone)]
@@ -179,12 +178,23 @@ impl InfoTab {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SearchMode {
+    Scope,
     Input,
     Results,
 }
 
+#[derive(Clone)]
+pub enum SearchScope {
+    Global,
+    Column(usize, String), // (col_index, col_name)
+}
+
 pub struct SearchState {
     pub mode: SearchMode,
+    pub scope: SearchScope,
+    pub scope_selected: usize, // selection index in scope popup
+    pub scope_scroll: usize,   // scroll offset for scope popup
+    pub scope_inner_rect: Option<(u16, u16, u16, u16)>, // (x, y, w, h) of inner area
     pub input: String,
     pub cursor: usize,
     pub results: Option<SearchResults>,
@@ -192,8 +202,27 @@ pub struct SearchState {
 }
 
 pub struct ExportPopup {
+    pub source: PathBuf,
     pub input: String,
     pub cursor: usize,
+    pub rect: Option<(u16, u16, u16, u16)>,
+    pub error: Option<String>,
+}
+
+pub struct ImportPopup {
+    pub input: String,
+    pub cursor: usize,
+    pub target: String,
+    pub target_cursor: usize,
+    pub active_field: ImportField,
+    pub rect: Option<(u16, u16, u16, u16)>,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ImportField {
+    Source,
+    Target,
 }
 
 #[derive(Clone)]
@@ -241,9 +270,26 @@ pub struct InfoPopup {
     pub title: String,
     pub lines: Vec<String>,
     pub scroll: usize,
+    pub rect: Option<(u16, u16, u16, u16)>,
+}
+
+pub struct ProgressPopup {
+    pub title: String,
+    pub message: String,
+    pub started: Instant,
+    receiver: mpsc::Receiver<anyhow::Result<String>>,
+    pub done_message: Option<String>,
+    pub done_at: Option<Instant>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum LoadedFileType {
+    Parquet,
+    Csv,
 }
 
 pub struct LoadedParquet {
+    pub file_type: LoadedFileType,
     pub path: PathBuf,
     pub schema_lines: Vec<String>,
     pub total_rows: usize,
@@ -300,7 +346,9 @@ pub struct App {
     pub info_scroll: usize,
     pub search_state: Option<SearchState>,
     pub export_popup: Option<ExportPopup>,
+    pub import_popup: Option<ImportPopup>,
     pub info_popup: Option<InfoPopup>,
+    pub progress_popup: Option<ProgressPopup>,
     palette_item_regions: Vec<Rect>,
     header_col_regions: Vec<(usize, Rect)>, // (absolute col_index, rect)
 }
@@ -323,7 +371,7 @@ impl App {
             loaded: None,
             active_pane: ActivePane::Files,
             status:
-                "Tab: pane | Enter: open/toggle | Ctrl+P: Tools|Palette | n/c/m/d: parquet ops | q: quit"
+                "Tab: pane | Enter: open/toggle | Ctrl+P: Palette | /: search | Ctrl+E: export | Ctrl+Q: quit"
                     .to_string(),
             status_at: Instant::now(),
             theme: palette_theme.theme(),
@@ -343,7 +391,9 @@ impl App {
             info_scroll: 0,
             search_state: None,
             export_popup: None,
+            import_popup: None,
             info_popup: None,
+            progress_popup: None,
             palette_item_regions: Vec::new(),
             header_col_regions: Vec::new(),
         };
@@ -353,7 +403,8 @@ impl App {
         Ok(app)
     }
 
-    /// Open a specific parquet file, setting the explorer root to its directory.
+    /// Open a specific parquet file, expanding ancestor directories so it is
+    /// visible in the file nav rooted at the current working directory.
     pub fn open_file(&mut self, path: &Path) -> anyhow::Result<()> {
         let path = if path.is_absolute() {
             path.to_path_buf()
@@ -364,11 +415,16 @@ impl App {
             .canonicalize()
             .with_context(|| format!("file not found: {}", path.display()))?;
 
+        // Expand every ancestor directory between explorer_root and the file
+        // so the file is visible in the tree.
         if let Some(parent) = path.parent() {
-            self.explorer_root = parent.to_path_buf();
-            self.explorer_expanded_dirs.clear();
-            self.explorer_expanded_dirs
-                .insert(self.explorer_root.clone());
+            let mut dir = parent.to_path_buf();
+            while dir != self.explorer_root && dir.starts_with(&self.explorer_root) {
+                self.explorer_expanded_dirs.insert(dir.clone());
+                if !dir.pop() {
+                    break;
+                }
+            }
             self.rescan_files()?;
         }
 
@@ -382,7 +438,7 @@ impl App {
         self.files.get(self.selected)
     }
 
-    fn selected_parquet_file(&self) -> Option<PathBuf> {
+    fn selected_data_file(&self) -> Option<(PathBuf, LoadedFileType)> {
         let path = self.selected_file()?;
         if self
             .file_is_dir
@@ -392,14 +448,14 @@ impl App {
         {
             return None;
         }
-        if path
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("parquet"))
-        {
-            return Some(path.clone());
+        let ext = path.extension().and_then(|ext| ext.to_str())?;
+        if ext.eq_ignore_ascii_case("parquet") {
+            Some((path.clone(), LoadedFileType::Parquet))
+        } else if ext.eq_ignore_ascii_case("csv") {
+            Some((path.clone(), LoadedFileType::Csv))
+        } else {
+            None
         }
-        None
     }
 
     pub fn display_path(&self, path: &Path) -> String {
@@ -509,7 +565,10 @@ impl App {
                 if is_dir {
                     dirs.push((path, name, true));
                 } else {
-                    files.push((path, name, false));
+                    let dominated = name.to_ascii_lowercase();
+                    if dominated.ends_with(".parquet") || dominated.ends_with(".csv") {
+                        files.push((path, name, false));
+                    }
                 }
             }
         }
@@ -806,7 +865,8 @@ impl App {
             "Copy" => self.open_file_action(FileActionKind::Copy),
             "Move" => self.open_file_action(FileActionKind::Move),
             "Delete" => self.arm_or_delete_selected()?,
-            "Export" => self.open_export_popup(),
+            "Import from CSV" => self.open_import_popup(),
+            "Export to CSV" => self.open_export_popup(),
             "Quit" => self.request_quit(),
             "Metadata" => self.switch_info_tab(InfoTab::Metadata)?,
             "Statistics" => self.switch_info_tab(InfoTab::Statistics)?,
@@ -864,21 +924,31 @@ impl App {
             return Ok(());
         }
 
-        if !path
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("parquet"))
-        {
-            self.set_status(format!("Not a parquet file: {}", self.display_path(&path)));
+        let ext = path.extension().and_then(|ext| ext.to_str());
+        let file_type = if ext.is_some_and(|e| e.eq_ignore_ascii_case("parquet")) {
+            LoadedFileType::Parquet
+        } else if ext.is_some_and(|e| e.eq_ignore_ascii_case("csv")) {
+            LoadedFileType::Csv
+        } else {
+            self.set_status(format!("Unsupported file: {}", self.display_path(&path)));
             return Ok(());
-        }
+        };
 
-        let meta = load_parquet_meta(&path)
-            .with_context(|| format!("unable to load {}", path.display()))?;
-        self.loaded = Some(LoadedParquet::from_meta(path, meta));
+        let meta = match file_type {
+            LoadedFileType::Parquet => load_parquet_meta(&path)
+                .with_context(|| format!("unable to load {}", path.display()))?,
+            LoadedFileType::Csv => load_csv_meta(&path)
+                .with_context(|| format!("unable to load {}", path.display()))?,
+        };
+        self.loaded = Some(LoadedParquet::from_meta(path, meta, file_type));
         self.info_tab = InfoTab::Schema;
         self.info_scroll = 0;
         self.ensure_preview_cache(true)?;
+
+        // Pre-build statistics and metadata so tab switching is instant (parquet only)
+        if file_type == LoadedFileType::Parquet {
+            self.prebuild_info_tabs();
+        }
 
         if let Some(loaded) = &self.loaded {
             self.set_status(format!("Loaded {}", self.display_path(&loaded.path)));
@@ -991,8 +1061,8 @@ impl App {
     }
 
     pub fn open_file_action(&mut self, kind: FileActionKind) {
-        let Some(source) = self.selected_parquet_file() else {
-            self.set_status("Select a parquet file first");
+        let Some((source, _)) = self.selected_data_file() else {
+            self.set_status("Select a data file first");
             return;
         };
 
@@ -1014,6 +1084,7 @@ impl App {
             source,
             cursor: default_target.chars().count(),
             input: default_target,
+            rect: None,
         });
     }
 
@@ -1121,7 +1192,110 @@ impl App {
         terminal_width: u16,
         terminal_height: u16,
     ) -> anyhow::Result<()> {
-        if self.file_action_popup.is_some() {
+        // Handle import popup — click outside closes it
+        if let Some(popup) = &self.import_popup {
+            if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) {
+                let inside = popup.rect.map_or(false, |(x, y, w, h)| {
+                    mouse.column >= x
+                        && mouse.row >= y
+                        && mouse.column < x.saturating_add(w)
+                        && mouse.row < y.saturating_add(h)
+                });
+                if !inside {
+                    self.import_popup = None;
+                    self.set_status("Import cancelled");
+                }
+            }
+            return Ok(());
+        }
+
+        // Handle export popup — click outside closes it
+        if let Some(popup) = &self.export_popup {
+            if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) {
+                let inside = popup.rect.map_or(false, |(x, y, w, h)| {
+                    mouse.column >= x
+                        && mouse.row >= y
+                        && mouse.column < x.saturating_add(w)
+                        && mouse.row < y.saturating_add(h)
+                });
+                if !inside {
+                    self.export_popup = None;
+                    self.set_status("Export cancelled");
+                }
+            }
+            return Ok(());
+        }
+
+        // Handle file action popup — click outside closes it
+        if let Some(popup) = &self.file_action_popup {
+            if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) {
+                let inside = popup.rect.map_or(false, |(x, y, w, h)| {
+                    mouse.column >= x
+                        && mouse.row >= y
+                        && mouse.column < x.saturating_add(w)
+                        && mouse.row < y.saturating_add(h)
+                });
+                if !inside {
+                    self.file_action_popup = None;
+                }
+            }
+            return Ok(());
+        }
+
+        // Handle search scope popup mouse clicks
+        if let Some(state) = &self.search_state {
+            if matches!(state.mode, SearchMode::Scope) {
+                if let Some((ix, iy, iw, ih)) = state.scope_inner_rect {
+                    let inside = mouse.column >= ix
+                        && mouse.row >= iy
+                        && mouse.column < ix.saturating_add(iw)
+                        && mouse.row < iy.saturating_add(ih);
+                    if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) {
+                        if inside {
+                            let row = (mouse.row - iy) as usize;
+                            let idx = state.scope_scroll + row;
+                            let options = self.search_scope_options();
+                            if let Some((scope, _)) = options.get(idx) {
+                                let scope = scope.clone();
+                                if let Some(state) = self.search_state.as_mut() {
+                                    state.scope = scope;
+                                    state.scope_selected = idx;
+                                    state.mode = SearchMode::Input;
+                                    state.input.clear();
+                                    state.cursor = 0;
+                                }
+                            }
+                        } else {
+                            self.search_state = None;
+                            self.set_status("Search cancelled");
+                        }
+                    } else if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                        if inside {
+                            let row = (mouse.row - iy) as usize;
+                            let idx = state.scope_scroll + row;
+                            if let Some(state) = self.search_state.as_mut() {
+                                state.scope_selected = idx;
+                            }
+                        }
+                    }
+                }
+                return Ok(());
+            }
+        }
+
+        // Handle info popup (Keybindings / About) — click outside closes it
+        if let Some(popup) = &self.info_popup {
+            if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) {
+                let inside = popup.rect.map_or(false, |(x, y, w, h)| {
+                    mouse.column >= x
+                        && mouse.row >= y
+                        && mouse.column < x.saturating_add(w)
+                        && mouse.row < y.saturating_add(h)
+                });
+                if !inside {
+                    self.info_popup = None;
+                }
+            }
             return Ok(());
         }
 
@@ -1134,6 +1308,9 @@ impl App {
                         self.apply_palette(theme);
                         self.palette_popup = None;
                     }
+                } else {
+                    // Click outside palette closes it
+                    self.palette_popup = None;
                 }
             } else if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
                 // Highlight on mouse down
@@ -1264,8 +1441,8 @@ impl App {
     }
 
     pub fn arm_or_delete_selected(&mut self) -> anyhow::Result<()> {
-        let Some(path) = self.selected_parquet_file() else {
-            self.set_status("Select a parquet file first");
+        let Some((path, _)) = self.selected_data_file() else {
+            self.set_status("Select a data file first");
             return Ok(());
         };
 
@@ -1362,7 +1539,7 @@ impl App {
 
     pub fn toggle_sort_column(&mut self, col_index: usize) -> anyhow::Result<()> {
         let Some(loaded) = &self.loaded else {
-            self.set_status("Load a parquet file first");
+            self.set_status("Load a file first");
             return Ok(());
         };
         if col_index >= loaded.total_cols {
@@ -1375,8 +1552,9 @@ impl App {
         if let Some(sort) = &loaded.sort_state {
             if sort.col_index == col_index {
                 if sort.ascending {
-                    // Switch to descending
-                    let indices = compute_sort_indices(&path, col_index, true)?;
+                    // Switch to descending by reversing the cached ascending indices
+                    let mut indices = sort.indices.clone();
+                    indices.reverse();
                     let col_name = sort.col_name.clone();
                     if let Some(loaded) = self.loaded.as_mut() {
                         loaded.sort_state = Some(SortState {
@@ -1405,8 +1583,13 @@ impl App {
             .get(col_index)
             .map(|line| line.split(':').next().unwrap_or("?").to_string())
             .unwrap_or_else(|| format!("col{col_index}"));
+        let file_type = loaded.file_type;
 
-        let indices = compute_sort_indices(&path, col_index, false)?;
+        self.set_status(format!("Sorting by {col_name}..."));
+        let indices = match file_type {
+            LoadedFileType::Parquet => compute_sort_indices(&path, col_index, false)?,
+            LoadedFileType::Csv => compute_csv_sort_indices(&path, col_index, false)?,
+        };
         if let Some(loaded) = self.loaded.as_mut() {
             loaded.sort_state = Some(SortState {
                 col_index,
@@ -1505,10 +1688,24 @@ impl App {
         Ok(())
     }
 
+    /// Pre-compute statistics and metadata so tab switching is instant.
+    /// Errors are silently ignored — tabs fall back to lazy loading on click.
+    fn prebuild_info_tabs(&mut self) {
+        let saved_tab = self.info_tab;
+        for tab in [InfoTab::Statistics, InfoTab::Metadata] {
+            self.info_tab = tab;
+            let _ = self.ensure_info_tab_data();
+        }
+        self.info_tab = saved_tab;
+    }
+
     pub fn ensure_info_tab_data(&mut self) -> anyhow::Result<()> {
         let Some(loaded) = &self.loaded else {
             return Ok(());
         };
+        if loaded.file_type == LoadedFileType::Csv {
+            return Ok(()); // CSV files don't have info tabs
+        }
         let path = loaded.path.clone();
 
         match self.info_tab {
@@ -1702,16 +1899,35 @@ impl App {
 
     pub fn open_search(&mut self) {
         if self.loaded.is_none() {
-            self.set_status("Load a parquet file first");
+            self.set_status("Load a file first");
             return;
         }
         self.search_state = Some(SearchState {
-            mode: SearchMode::Input,
+            mode: SearchMode::Scope,
+            scope: SearchScope::Global,
+            scope_selected: 0,
+            scope_scroll: 0,
+            scope_inner_rect: None,
             input: String::new(),
             cursor: 0,
             results: None,
             result_offset: 0,
         });
+    }
+
+    /// Build the list of search scope options: "All columns" + each column name.
+    pub fn search_scope_options(&self) -> Vec<(SearchScope, String)> {
+        let mut options = vec![(SearchScope::Global, "All columns".to_string())];
+        if let Some(loaded) = &self.loaded {
+            for (idx, line) in loaded.schema_lines.iter().enumerate() {
+                let col_name = line.split(':').next().unwrap_or("?").to_string();
+                options.push((
+                    SearchScope::Column(idx, col_name.clone()),
+                    format!("Column: {col_name}"),
+                ));
+            }
+        }
+        options
     }
 
     pub fn handle_search_key(&mut self, key: KeyEvent) -> anyhow::Result<bool> {
@@ -1720,10 +1936,50 @@ impl App {
         };
 
         match state.mode {
+            SearchMode::Scope => {
+                let option_count = self.search_scope_options().len();
+                match key.code {
+                    KeyCode::Esc => {
+                        self.search_state = None;
+                        self.set_status("Search cancelled");
+                    }
+                    KeyCode::Up => {
+                        if let Some(state) = self.search_state.as_mut() {
+                            state.scope_selected = state.scope_selected.saturating_sub(1);
+                        }
+                    }
+                    KeyCode::Down => {
+                        if let Some(state) = self.search_state.as_mut() {
+                            state.scope_selected =
+                                cmp::min(state.scope_selected + 1, option_count.saturating_sub(1));
+                        }
+                    }
+                    KeyCode::Enter => {
+                        let options = self.search_scope_options();
+                        if let Some(state) = self.search_state.as_mut() {
+                            if let Some((scope, _)) = options.get(state.scope_selected) {
+                                state.scope = scope.clone();
+                                state.mode = SearchMode::Input;
+                                state.input.clear();
+                                state.cursor = 0;
+                            }
+                        }
+                    }
+                    _ => return Ok(false),
+                }
+                return Ok(true);
+            }
             SearchMode::Input => match key.code {
                 KeyCode::Esc => {
-                    self.search_state = None;
-                    self.set_status("Search cancelled");
+                    // Go back to scope selection
+                    if let Some(state) = self.search_state.as_mut() {
+                        state.mode = SearchMode::Scope;
+                        state.scope_selected = 0;
+                        state.scope_scroll = 0;
+                        state.scope_inner_rect = None;
+                        state.input.clear();
+                        state.cursor = 0;
+                    }
                 }
                 KeyCode::Enter => {
                     if state.input.trim().is_empty() {
@@ -1732,7 +1988,8 @@ impl App {
                         return Ok(true);
                     }
                     let query = state.input.clone();
-                    self.execute_search(&query)?;
+                    let scope = state.scope.clone();
+                    self.execute_search(&query, &scope)?;
                 }
                 KeyCode::Backspace => {
                     if state.cursor > 0 {
@@ -1762,7 +2019,10 @@ impl App {
                 }
                 KeyCode::Char('/') => {
                     if let Some(state) = self.search_state.as_mut() {
-                        state.mode = SearchMode::Input;
+                        state.mode = SearchMode::Scope;
+                        state.scope_selected = 0;
+                        state.scope_scroll = 0;
+                        state.scope_inner_rect = None;
                         state.input.clear();
                         state.cursor = 0;
                     }
@@ -1786,7 +2046,9 @@ impl App {
                     // handled later if we add col scrolling for search results
                 }
                 KeyCode::Right => {}
-                KeyCode::Char('e') => {
+                KeyCode::Char('e')
+                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
                     self.open_export_from_search();
                     return Ok(true);
                 }
@@ -1796,19 +2058,31 @@ impl App {
         Ok(true)
     }
 
-    fn execute_search(&mut self, query: &str) -> anyhow::Result<()> {
+    fn execute_search(&mut self, query: &str, scope: &SearchScope) -> anyhow::Result<()> {
         let Some(loaded) = &self.loaded else {
             return Ok(());
         };
         let path = loaded.path.clone();
-        self.set_status(format!("Searching for '{query}'..."));
-        let results = search_parquet_rows(&path, query, CELL_CHAR_LIMIT)?;
+        let file_type = loaded.file_type;
+        let scope_label = match scope {
+            SearchScope::Global => "all columns".to_string(),
+            SearchScope::Column(_, name) => format!("column '{name}'"),
+        };
+        let col_index = match scope {
+            SearchScope::Global => None,
+            SearchScope::Column(idx, _) => Some(*idx),
+        };
+        self.set_status(format!("Searching {scope_label} for '{query}'..."));
+        let results = match file_type {
+            LoadedFileType::Parquet => search_parquet_rows(&path, query, col_index, CELL_CHAR_LIMIT)?,
+            LoadedFileType::Csv => search_csv_rows(&path, query, col_index, CELL_CHAR_LIMIT)?,
+        };
         let count = results.matching_rows.len();
         let capped = results.capped;
         let msg = if capped {
-            format!("Found {count}+ matches for '{query}' (capped)")
+            format!("Found {count}+ matches for '{query}' in {scope_label} (capped)")
         } else {
-            format!("Found {count} matches for '{query}'")
+            format!("Found {count} matches for '{query}' in {scope_label}")
         };
         if let Some(state) = self.search_state.as_mut() {
             state.mode = SearchMode::Results;
@@ -1825,14 +2099,27 @@ impl App {
 
     pub fn open_export_popup(&mut self) {
         let Some(loaded) = &self.loaded else {
-            self.set_status("Load a parquet file first");
+            self.set_status("Load a file first");
             return;
         };
+        if loaded.file_type == LoadedFileType::Csv {
+            self.set_status("Export to CSV is only available for Parquet files");
+            return;
+        }
+        let source = loaded.path.clone();
         let source_rel = self.display_path(&loaded.path);
-        let default = format!("{source_rel}.export.parquet");
+        // Replace .parquet extension with .csv
+        let default = if source_rel.ends_with(".parquet") {
+            format!("{}.csv", &source_rel[..source_rel.len() - 8])
+        } else {
+            format!("{source_rel}.csv")
+        };
         self.export_popup = Some(ExportPopup {
+            source,
             cursor: default.chars().count(),
             input: default,
+            rect: None,
+            error: None,
         });
     }
 
@@ -1840,12 +2127,200 @@ impl App {
         let Some(loaded) = &self.loaded else {
             return;
         };
+        let source = loaded.path.clone();
         let source_rel = self.display_path(&loaded.path);
-        let default = format!("{source_rel}.filtered.parquet");
+        let default = if source_rel.ends_with(".parquet") {
+            format!("{}.filtered.csv", &source_rel[..source_rel.len() - 8])
+        } else {
+            format!("{source_rel}.filtered.csv")
+        };
         self.export_popup = Some(ExportPopup {
+            source,
             cursor: default.chars().count(),
             input: default,
+            rect: None,
+            error: None,
         });
+    }
+
+    // ------------------------------------------------------------------
+    // Import from CSV
+    // ------------------------------------------------------------------
+
+    pub fn open_import_popup(&mut self) {
+        let default_source = String::new();
+        self.import_popup = Some(ImportPopup {
+            input: default_source,
+            cursor: 0,
+            target: String::new(),
+            target_cursor: 0,
+            active_field: ImportField::Source,
+            rect: None,
+            error: None,
+        });
+    }
+
+    pub fn handle_import_key(&mut self, key: KeyEvent) -> anyhow::Result<bool> {
+        let Some(popup) = self.import_popup.as_mut() else {
+            return Ok(false);
+        };
+
+        match key.code {
+            KeyCode::Esc => {
+                self.import_popup = None;
+                self.set_status("Import cancelled");
+            }
+            KeyCode::Tab => {
+                // Toggle between source and target fields
+                popup.active_field = match popup.active_field {
+                    ImportField::Source => ImportField::Target,
+                    ImportField::Target => ImportField::Source,
+                };
+            }
+            KeyCode::Enter => {
+                self.execute_import()?;
+            }
+            KeyCode::Backspace => {
+                let (input, cursor) = match popup.active_field {
+                    ImportField::Source => (&mut popup.input, &mut popup.cursor),
+                    ImportField::Target => (&mut popup.target, &mut popup.target_cursor),
+                };
+                if *cursor > 0 {
+                    let from = char_to_byte_index(input, *cursor - 1);
+                    let to = char_to_byte_index(input, *cursor);
+                    input.replace_range(from..to, "");
+                    *cursor -= 1;
+                    // Auto-fill target when editing source
+                    if popup.active_field == ImportField::Source {
+                        let src = &popup.input;
+                        popup.target = if src.ends_with(".csv") {
+                            format!("{}.parquet", &src[..src.len() - 4])
+                        } else {
+                            format!("{src}.parquet")
+                        };
+                        popup.target_cursor = popup.target.chars().count();
+                    }
+                }
+            }
+            KeyCode::Delete => {
+                let (input, cursor) = match popup.active_field {
+                    ImportField::Source => (&mut popup.input, &mut popup.cursor),
+                    ImportField::Target => (&mut popup.target, &mut popup.target_cursor),
+                };
+                if *cursor < input.chars().count() {
+                    let from = char_to_byte_index(input, *cursor);
+                    let to = char_to_byte_index(input, *cursor + 1);
+                    input.replace_range(from..to, "");
+                }
+            }
+            KeyCode::Left => {
+                let cursor = match popup.active_field {
+                    ImportField::Source => &mut popup.cursor,
+                    ImportField::Target => &mut popup.target_cursor,
+                };
+                *cursor = cursor.saturating_sub(1);
+            }
+            KeyCode::Right => {
+                let (input, cursor) = match popup.active_field {
+                    ImportField::Source => (&popup.input, &mut popup.cursor),
+                    ImportField::Target => (&popup.target, &mut popup.target_cursor),
+                };
+                *cursor = cmp::min(*cursor + 1, input.chars().count());
+            }
+            KeyCode::Home => {
+                let cursor = match popup.active_field {
+                    ImportField::Source => &mut popup.cursor,
+                    ImportField::Target => &mut popup.target_cursor,
+                };
+                *cursor = 0;
+            }
+            KeyCode::End => {
+                let (input, cursor) = match popup.active_field {
+                    ImportField::Source => (&popup.input, &mut popup.cursor),
+                    ImportField::Target => (&popup.target, &mut popup.target_cursor),
+                };
+                *cursor = input.chars().count();
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                popup.error = None;
+                let (input, cursor) = match popup.active_field {
+                    ImportField::Source => (&mut popup.input, &mut popup.cursor),
+                    ImportField::Target => (&mut popup.target, &mut popup.target_cursor),
+                };
+                let byte_idx = char_to_byte_index(input, *cursor);
+                input.insert(byte_idx, c);
+                *cursor += 1;
+                // Auto-fill target when editing source
+                if popup.active_field == ImportField::Source {
+                    let src = &popup.input;
+                    popup.target = if src.ends_with(".csv") {
+                        format!("{}.parquet", &src[..src.len() - 4])
+                    } else {
+                        format!("{src}.parquet")
+                    };
+                    popup.target_cursor = popup.target.chars().count();
+                }
+            }
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    fn execute_import(&mut self) -> anyhow::Result<()> {
+        let Some(popup) = &self.import_popup else {
+            return Ok(());
+        };
+
+        // Resolve and validate paths before taking the popup so errors don't lose it
+        let source = match self.resolve_target_path(&popup.input) {
+            Ok(p) => p,
+            Err(e) => {
+                if let Some(p) = self.import_popup.as_mut() {
+                    p.error = Some(format!("Source: {e}"));
+                }
+                return Ok(());
+            }
+        };
+        if !source.exists() {
+            if let Some(p) = self.import_popup.as_mut() {
+                p.error = Some(format!("Source file not found: {}", source.display()));
+            }
+            return Ok(());
+        }
+        let dest = match self.resolve_target_path(&popup.target) {
+            Ok(p) => p,
+            Err(e) => {
+                if let Some(p) = self.import_popup.as_mut() {
+                    p.error = Some(format!("Target: {e}"));
+                }
+                return Ok(());
+            }
+        };
+
+        // Now take the popup
+        self.import_popup = None;
+        let source_display = self.display_path(&source);
+        let dest_display = self.display_path(&dest);
+
+        let (tx, rx) = mpsc::channel();
+        let src_disp = source_display.clone();
+        let dst_disp = dest_display.clone();
+        thread::spawn(move || {
+            let result = import_csv(&source, &dest)
+                .map(|rows| format!("Imported {rows} rows from {src_disp} to {dst_disp}"));
+            let _ = tx.send(result);
+        });
+
+        self.progress_popup = Some(ProgressPopup {
+            title: "Importing from CSV".to_string(),
+            message: format!("Reading {source_display}..."),
+            started: Instant::now(),
+            receiver: rx,
+            done_message: None,
+            done_at: None,
+        });
+
+        Ok(())
     }
 
     // ------------------------------------------------------------------
@@ -1867,18 +2342,13 @@ impl App {
                 "  Backspace      Collapse directory or go to parent".to_string(),
                 String::new(),
                 "Info Tabs".to_string(),
-                "  1              Schema tab".to_string(),
-                "  2              Statistics tab".to_string(),
-                "  3              Metadata tab".to_string(),
-                "  i              Switch to Metadata tab".to_string(),
-                "  s              Switch to Statistics tab".to_string(),
+                "  1 / click      Schema tab".to_string(),
+                "  2 / s / click  Statistics tab".to_string(),
+                "  3 / i / click  Metadata tab".to_string(),
                 String::new(),
                 "File Operations".to_string(),
-                "  n              Rename file".to_string(),
-                "  c              Copy file".to_string(),
-                "  m              Move file".to_string(),
-                "  d              Delete file (press twice)".to_string(),
-                "  e              Export parquet".to_string(),
+                "  Ctrl+I         Import from CSV".to_string(),
+                "  Ctrl+E         Export to CSV".to_string(),
                 String::new(),
                 "Sort".to_string(),
                 "  o              Sort by leftmost column (asc/desc/none)".to_string(),
@@ -1891,10 +2361,11 @@ impl App {
                 String::new(),
                 "General".to_string(),
                 "  F1             This help".to_string(),
-                "  q / Ctrl+Q     Quit".to_string(),
+                "  Ctrl+Q         Quit".to_string(),
                 "  Esc            Close popup/menu".to_string(),
             ],
             scroll: 0,
+            rect: None,
         });
     }
 
@@ -1917,6 +2388,7 @@ impl App {
                 "  - Multiple color themes".to_string(),
             ],
             scroll: 0,
+            rect: None,
         });
     }
 
@@ -1990,6 +2462,7 @@ impl App {
                 popup.cursor = popup.input.chars().count();
             }
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                popup.error = None;
                 let byte_idx = char_to_byte_index(&popup.input, popup.cursor);
                 popup.input.insert(byte_idx, c);
                 popup.cursor += 1;
@@ -2000,15 +2473,24 @@ impl App {
     }
 
     fn execute_export(&mut self) -> anyhow::Result<()> {
-        let Some(popup) = self.export_popup.take() else {
-            return Ok(());
-        };
-        let Some(loaded) = &self.loaded else {
+        let Some(popup) = &self.export_popup else {
             return Ok(());
         };
 
-        let source = loaded.path.clone();
-        let dest = self.resolve_target_path(&popup.input)?;
+        let source = popup.source.clone();
+        let dest = match self.resolve_target_path(&popup.input) {
+            Ok(p) => p,
+            Err(e) => {
+                if let Some(p) = self.export_popup.as_mut() {
+                    p.error = Some(format!("Target: {e}"));
+                }
+                return Ok(());
+            }
+        };
+        let dest_display = self.display_path(&dest);
+
+        // Now take the popup
+        self.export_popup = None;
 
         // If search filter is active, export only matching rows
         let row_indices: Option<Vec<usize>> = self
@@ -2017,15 +2499,95 @@ impl App {
             .and_then(|s| s.results.as_ref())
             .map(|r| r.matching_rows.iter().map(|(idx, _)| *idx).collect());
 
-        let rows_written =
-            export_parquet(&source, &dest, row_indices.as_deref())?;
-        self.rescan_files()?;
-        self.set_status(format!(
-            "Exported {} rows to {}",
-            rows_written,
-            self.display_path(&dest)
-        ));
+        let (tx, rx) = mpsc::channel();
+        let dest_disp = dest_display.clone();
+        thread::spawn(move || {
+            let result = export_csv(&source, &dest, row_indices.as_deref())
+                .map(|rows| format!("Exported {rows} rows to {dest_disp}"));
+            let _ = tx.send(result);
+        });
+
+        self.progress_popup = Some(ProgressPopup {
+            title: "Exporting to CSV".to_string(),
+            message: format!("Writing to {dest_display}..."),
+            started: Instant::now(),
+            receiver: rx,
+            done_message: None,
+            done_at: None,
+        });
+
         Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Progress popup
+    // ------------------------------------------------------------------
+
+    const PROGRESS_DONE_DISPLAY_MS: u64 = 2000;
+    const PROGRESS_ERROR_DISPLAY_MS: u64 = 4000;
+
+    pub fn poll_progress(&mut self) {
+        let Some(progress) = &self.progress_popup else {
+            return;
+        };
+
+        // Already showing completion message — check if it's time to close
+        if let Some(done_at) = progress.done_at {
+            let is_error = progress
+                .done_message
+                .as_ref()
+                .is_some_and(|m| m.starts_with("Error"));
+            let display_ms = if is_error {
+                Self::PROGRESS_ERROR_DISPLAY_MS
+            } else {
+                Self::PROGRESS_DONE_DISPLAY_MS
+            };
+            if done_at.elapsed() >= Duration::from_millis(display_ms) {
+                self.progress_popup = None;
+                let _ = self.rescan_files();
+            }
+            return;
+        }
+
+        // Check if the background task is done
+        match progress.receiver.try_recv() {
+            Ok(Ok(msg)) => {
+                self.set_status(msg.clone());
+                if let Some(p) = self.progress_popup.as_mut() {
+                    p.done_message = Some(msg);
+                    p.done_at = Some(Instant::now());
+                }
+            }
+            Ok(Err(err)) => {
+                let msg = format!("Error: {err}");
+                self.set_status(msg.clone());
+                if let Some(p) = self.progress_popup.as_mut() {
+                    p.done_message = Some(msg);
+                    p.done_at = Some(Instant::now());
+                }
+            }
+            Err(mpsc::TryRecvError::Disconnected) => {
+                let msg = "Error: operation failed unexpectedly".to_string();
+                self.set_status(msg.clone());
+                if let Some(p) = self.progress_popup.as_mut() {
+                    p.done_message = Some(msg);
+                    p.done_at = Some(Instant::now());
+                }
+            }
+            Err(mpsc::TryRecvError::Empty) => {} // still working
+        }
+    }
+
+    pub fn progress_spinner(&self) -> &str {
+        let Some(progress) = &self.progress_popup else {
+            return "";
+        };
+        if progress.done_at.is_some() {
+            return "✓";
+        }
+        const FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        let idx = (progress.started.elapsed().as_millis() / 100) as usize % FRAMES.len();
+        FRAMES[idx]
     }
 
     fn apply_palette(&mut self, palette_theme: PaletteTheme) {
@@ -2262,7 +2824,7 @@ impl App {
             return Ok(());
         }
 
-        let (path, row_start, row_count, projection, sorted_row_indices) = {
+        let (path, file_type, row_start, row_count, projection, sorted_row_indices) = {
             let loaded = self.loaded.as_mut().expect("loaded exists");
             let row_window = cmp::max(DEFAULT_ROW_WINDOW, loaded.viewport_rows.saturating_mul(3));
             let col_window = cmp::max(DEFAULT_COL_WINDOW, loaded.viewport_cols.saturating_add(6));
@@ -2284,17 +2846,25 @@ impl App {
                 sort.indices[row_start..end].to_vec()
             });
 
-            (loaded.path.clone(), row_start, row_count, projection, sorted_row_indices)
+            (loaded.path.clone(), loaded.file_type, row_start, row_count, projection, sorted_row_indices)
         };
 
         let slice = if let Some(row_indices) = sorted_row_indices {
-            let mut s = load_parquet_rows(&path, &row_indices, &projection, CELL_CHAR_LIMIT)
-                .with_context(|| format!("unable to read sorted preview for {}", path.display()))?;
+            let mut s = match file_type {
+                LoadedFileType::Parquet => load_parquet_rows(&path, &row_indices, &projection, CELL_CHAR_LIMIT)
+                    .with_context(|| format!("unable to read sorted preview for {}", path.display()))?,
+                LoadedFileType::Csv => load_csv_rows(&path, &row_indices, &projection, CELL_CHAR_LIMIT)
+                    .with_context(|| format!("unable to read sorted CSV preview for {}", path.display()))?,
+            };
             s.row_start = row_start;
             s
         } else {
-            load_parquet_slice(&path, row_start, row_count, &projection, CELL_CHAR_LIMIT)
-                .with_context(|| format!("unable to read preview window for {}", path.display()))?
+            match file_type {
+                LoadedFileType::Parquet => load_parquet_slice(&path, row_start, row_count, &projection, CELL_CHAR_LIMIT)
+                    .with_context(|| format!("unable to read preview window for {}", path.display()))?,
+                LoadedFileType::Csv => load_csv_slice(&path, row_start, row_count, &projection, CELL_CHAR_LIMIT)
+                    .with_context(|| format!("unable to read CSV preview for {}", path.display()))?,
+            }
         };
 
         if let Some(loaded) = self.loaded.as_mut() {
@@ -2326,8 +2896,9 @@ impl App {
 }
 
 impl LoadedParquet {
-    fn from_meta(path: PathBuf, meta: ParquetMeta) -> Self {
+    fn from_meta(path: PathBuf, meta: ParquetMeta, file_type: LoadedFileType) -> Self {
         Self {
+            file_type,
             path,
             schema_lines: meta.schema_lines,
             total_rows: meta.total_rows,
