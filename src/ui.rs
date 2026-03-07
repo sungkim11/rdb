@@ -6,7 +6,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 
-use crate::app::{ActivePane, App, InfoTab, OpenMenu, SearchMode};
+use crate::app::{ActivePane, App, InfoLineKind, InfoTab, OpenMenu, SearchMode};
 use crate::theme::PaletteTheme;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
@@ -686,14 +686,34 @@ fn draw_info_tabs(frame: &mut Frame, area: Rect, app: &mut App) {
     let inner_height = usize::from(content_inner.height);
 
     let info_lines = app.info_lines_for_render();
-    let normal_style = Style::default().fg(app.theme.menu_fg).bg(app.theme.menu_bg);
     let scroll = cmp::min(app.info_scroll, info_lines.len().saturating_sub(inner_height));
+
+    let header_style = Style::default()
+        .fg(app.theme.active_fg)
+        .bg(app.theme.active_bg)
+        .add_modifier(Modifier::BOLD);
+    let label_style = Style::default()
+        .fg(app.theme.fg)
+        .bg(app.theme.menu_bg)
+        .add_modifier(Modifier::BOLD);
+    let value_style = Style::default().fg(app.theme.menu_fg).bg(app.theme.menu_bg);
+    let sep_style = Style::default().fg(app.theme.panel_border).bg(app.theme.menu_bg);
+    let plain_style = Style::default().fg(app.theme.dim_fg).bg(app.theme.menu_bg);
 
     let mut lines: Vec<Line> = info_lines
         .iter()
         .skip(scroll)
         .take(inner_height)
-        .map(|line| Line::styled(clip_or_pad(line, inner_width), normal_style))
+        .map(|info_line| {
+            let (style, text) = match info_line.kind {
+                InfoLineKind::Header => (header_style, info_line.text.clone()),
+                InfoLineKind::Label => (label_style, info_line.text.clone()),
+                InfoLineKind::Value => (value_style, info_line.text.clone()),
+                InfoLineKind::Separator => (sep_style, "\u{2500}".repeat(inner_width)),
+                InfoLineKind::Plain => (plain_style, info_line.text.clone()),
+            };
+            Line::styled(clip_or_pad(&text, inner_width), style)
+        })
         .collect();
 
     while lines.len() < inner_height {

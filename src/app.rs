@@ -204,6 +204,39 @@ pub struct SortState {
     pub indices: Vec<usize>,
 }
 
+#[derive(Clone)]
+pub enum InfoLineKind {
+    Header,
+    Label,
+    Value,
+    Separator,
+    Plain,
+}
+
+#[derive(Clone)]
+pub struct InfoLine {
+    pub kind: InfoLineKind,
+    pub text: String,
+}
+
+impl InfoLine {
+    fn header(text: impl Into<String>) -> Self {
+        Self { kind: InfoLineKind::Header, text: text.into() }
+    }
+    fn label(text: impl Into<String>) -> Self {
+        Self { kind: InfoLineKind::Label, text: text.into() }
+    }
+    fn value(text: impl Into<String>) -> Self {
+        Self { kind: InfoLineKind::Value, text: text.into() }
+    }
+    fn sep() -> Self {
+        Self { kind: InfoLineKind::Separator, text: String::new() }
+    }
+    fn plain(text: impl Into<String>) -> Self {
+        Self { kind: InfoLineKind::Plain, text: text.into() }
+    }
+}
+
 pub struct InfoPopup {
     pub title: String,
     pub lines: Vec<String>,
@@ -223,8 +256,8 @@ pub struct LoadedParquet {
     pub cache_col_start: usize,
     pub cache_columns: Vec<String>,
     pub cache_rows: Vec<Vec<String>>,
-    pub stats_lines: Option<Vec<String>>,
-    pub metadata_lines: Option<Vec<String>>,
+    pub stats_lines: Option<Vec<InfoLine>>,
+    pub metadata_lines: Option<Vec<InfoLine>>,
     pub sort_state: Option<SortState>,
 }
 
@@ -318,6 +351,31 @@ impl App {
         app.explorer_expanded_dirs.insert(app.explorer_root.clone());
         app.rescan_files()?;
         Ok(app)
+    }
+
+    /// Open a specific parquet file, setting the explorer root to its directory.
+    pub fn open_file(&mut self, path: &Path) -> anyhow::Result<()> {
+        let path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.root.join(path)
+        };
+        let path = path
+            .canonicalize()
+            .with_context(|| format!("file not found: {}", path.display()))?;
+
+        if let Some(parent) = path.parent() {
+            self.explorer_root = parent.to_path_buf();
+            self.explorer_expanded_dirs.clear();
+            self.explorer_expanded_dirs
+                .insert(self.explorer_root.clone());
+            self.rescan_files()?;
+        }
+
+        self.select_path(&path);
+        self.load_selected()?;
+        self.active_pane = ActivePane::Preview;
+        Ok(())
     }
 
     pub fn selected_file(&self) -> Option<&PathBuf> {
@@ -1495,32 +1553,58 @@ impl App {
         self.info_scroll = new.max(0) as usize;
     }
 
-    pub fn info_lines_for_render(&self) -> Vec<String> {
+    pub fn info_lines_for_render(&self) -> Vec<InfoLine> {
         let Some(loaded) = &self.loaded else {
-            return vec!["Press Enter on a parquet file to load".to_string()];
+            return vec![InfoLine::plain("Press Enter on a parquet file to load")];
         };
         match self.info_tab {
-            InfoTab::Schema => loaded.schema_lines.clone(),
+            InfoTab::Schema => Self::format_schema_lines(loaded),
             InfoTab::Statistics => loaded
                 .stats_lines
                 .clone()
-                .unwrap_or_else(|| vec!["Press 's' or click Statistics tab to load".to_string()]),
+                .unwrap_or_else(|| vec![InfoLine::plain("Press 's' or click Statistics tab to load")]),
             InfoTab::Metadata => loaded
                 .metadata_lines
                 .clone()
-                .unwrap_or_else(|| vec!["Press 'i' or click Metadata tab to load".to_string()]),
+                .unwrap_or_else(|| vec![InfoLine::plain("Press 'i' or click Metadata tab to load")]),
         }
     }
 
-    fn format_stats_lines(stats: &[ColumnStatistics]) -> Vec<String> {
+    fn format_schema_lines(loaded: &LoadedParquet) -> Vec<InfoLine> {
         let mut lines = Vec::new();
-        lines.push(format!(
+        lines.push(InfoLine::header(format!(
+            " {:>4}  {:30} {}",
+            "#", "Column Name", "Data Type"
+        )));
+        lines.push(InfoLine::sep());
+        for (idx, raw) in loaded.schema_lines.iter().enumerate() {
+            let (name, dtype) = raw
+                .split_once(": ")
+                .unwrap_or((raw.as_str(), ""));
+            lines.push(InfoLine::value(format!(
+                " {:>4}  {:30} {}",
+                idx + 1,
+                truncate_str(name, 30),
+                dtype,
+            )));
+        }
+        lines.push(InfoLine::sep());
+        lines.push(InfoLine::label(format!(
+            " {} columns, {} rows",
+            loaded.total_cols, loaded.total_rows
+        )));
+        lines
+    }
+
+    fn format_stats_lines(stats: &[ColumnStatistics]) -> Vec<InfoLine> {
+        let mut lines = Vec::new();
+        lines.push(InfoLine::header(format!(
             " {:20} {:12} {:>8} {:>8} {:>14} {:>14} {:>14}",
             "Column", "Type", "Total", "Nulls", "Min", "Max", "Mean"
-        ));
-        lines.push("-".repeat(100));
+        )));
+        lines.push(InfoLine::sep());
         for stat in stats {
-            lines.push(format!(
+            lines.push(InfoLine::value(format!(
                 " {:20} {:12} {:>8} {:>8} {:>14} {:>14} {:>14}",
                 truncate_str(&stat.name, 20),
                 truncate_str(&stat.dtype, 12),
@@ -1529,44 +1613,87 @@ impl App {
                 truncate_str(&stat.min_value, 14),
                 truncate_str(&stat.max_value, 14),
                 truncate_str(&stat.mean_value, 14),
-            ));
+            )));
         }
         lines
     }
 
-    fn format_metadata_lines(info: &ParquetFileInfo) -> Vec<String> {
+    fn format_metadata_lines(info: &ParquetFileInfo) -> Vec<InfoLine> {
         let mut lines = Vec::new();
-        lines.push(format!(
-            "File size: {} bytes ({:.2} MB)",
-            info.file_size_bytes,
-            info.file_size_bytes as f64 / 1_048_576.0
-        ));
-        lines.push(format!("Created by: {}", info.created_by));
-        lines.push(format!("Row groups: {}", info.num_row_groups));
-        lines.push(String::new());
+        lines.push(InfoLine::header(" File Information"));
+        lines.push(InfoLine::sep());
+        lines.push(InfoLine::label(format!(
+            "  File size    {}",
+            Self::format_bytes(info.file_size_bytes)
+        )));
+        lines.push(InfoLine::label(format!(
+            "  Created by   {}",
+            info.created_by
+        )));
+        lines.push(InfoLine::label(format!(
+            "  Row groups   {}",
+            info.num_row_groups
+        )));
+        lines.push(InfoLine::sep());
 
         for rg in &info.row_groups {
-            lines.push(format!(
-                "--- Row Group {} ---  rows: {}  size: {} bytes ({:.2} MB)",
-                rg.index,
-                rg.num_rows,
-                rg.total_byte_size,
-                rg.total_byte_size as f64 / 1_048_576.0,
-            ));
+            lines.push(InfoLine::header(format!(
+                " Row Group {}",
+                rg.index
+            )));
+            lines.push(InfoLine::label(format!(
+                "  Rows  {}    Size  {}",
+                Self::format_number(rg.num_rows as u64),
+                Self::format_bytes(rg.total_byte_size as u64),
+            )));
+            lines.push(InfoLine::sep());
+            lines.push(InfoLine::value(format!(
+                "  {:24} {:12} {:>12} {:>12} {:>6}",
+                "Column", "Codec", "Compressed", "Raw", "Ratio"
+            )));
+            lines.push(InfoLine::sep());
             for col in &rg.columns {
                 let ratio = if col.uncompressed_size > 0 {
                     col.compressed_size as f64 / col.uncompressed_size as f64
                 } else {
                     0.0
                 };
-                lines.push(format!(
-                    "  {}: {} | {}/{} bytes (ratio {:.2})",
-                    col.name, col.compression, col.compressed_size, col.uncompressed_size, ratio,
-                ));
+                lines.push(InfoLine::plain(format!(
+                    "  {:24} {:12} {:>12} {:>12} {:>5.1}%",
+                    truncate_str(&col.name, 24),
+                    truncate_str(&col.compression, 12),
+                    Self::format_bytes(col.compressed_size as u64),
+                    Self::format_bytes(col.uncompressed_size as u64),
+                    ratio * 100.0,
+                )));
             }
-            lines.push(String::new());
+            lines.push(InfoLine::sep());
         }
         lines
+    }
+
+    fn format_bytes(bytes: u64) -> String {
+        if bytes >= 1_073_741_824 {
+            format!("{:.2} GB", bytes as f64 / 1_073_741_824.0)
+        } else if bytes >= 1_048_576 {
+            format!("{:.2} MB", bytes as f64 / 1_048_576.0)
+        } else if bytes >= 1024 {
+            format!("{:.1} KB", bytes as f64 / 1024.0)
+        } else {
+            format!("{} B", bytes)
+        }
+    }
+
+    fn format_number(n: u64) -> String {
+        let s = n.to_string();
+        let mut result = String::new();
+        for (i, c) in s.chars().rev().enumerate() {
+            if i > 0 && i % 3 == 0 {
+                result.push(',');
+            }
+            result.push(c);
+        }
+        result.chars().rev().collect()
     }
 
     // ------------------------------------------------------------------
