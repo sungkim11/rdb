@@ -1,10 +1,15 @@
 use std::cmp;
 use std::collections::HashSet;
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crate::parquet::{ParquetMeta, fit_visible_columns, load_parquet_meta, load_parquet_slice};
+use crate::parquet::{
+    ColumnStatistics, ParquetFileInfo, ParquetMeta, SearchResults, compute_column_statistics,
+    compute_sort_indices, export_parquet, fit_visible_columns, load_parquet_file_info,
+    load_parquet_meta, load_parquet_rows, load_parquet_slice, search_parquet_rows,
+};
 use crate::theme::{PaletteTheme, Theme};
 use anyhow::Context;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -13,6 +18,8 @@ const DEFAULT_ROW_WINDOW: usize = 256;
 const DEFAULT_COL_WINDOW: usize = 24;
 const CELL_CHAR_LIMIT: usize = 48;
 const DOUBLE_CLICK_MS: u64 = 500;
+const SETTINGS_FILE: &str = "settings.conf";
+const APP_NAME: &str = "rdb";
 
 #[derive(Clone, Copy)]
 struct Rect {
@@ -39,13 +46,65 @@ struct MouseRegions {
     rows_inner: Rect,
 }
 
-#[derive(Clone, Copy)]
-enum TopMenuTarget {
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum OpenMenu {
     File,
     View,
     Tools,
     Help,
 }
+
+pub struct MenuEntry {
+    pub label: &'static str,
+    pub shortcut: &'static str,
+    pub is_separator: bool,
+}
+
+const fn entry(label: &'static str, shortcut: &'static str) -> MenuEntry {
+    MenuEntry { label, shortcut, is_separator: false }
+}
+
+const fn sep() -> MenuEntry {
+    MenuEntry { label: "", shortcut: "", is_separator: true }
+}
+
+impl OpenMenu {
+    pub fn items(self) -> &'static [MenuEntry] {
+        match self {
+            OpenMenu::File => &FILE_MENU,
+            OpenMenu::View => &VIEW_MENU,
+            OpenMenu::Tools => &TOOLS_MENU,
+            OpenMenu::Help => &HELP_MENU,
+        }
+    }
+}
+
+static FILE_MENU: [MenuEntry; 7] = [
+    entry("Rename", "n"),
+    entry("Copy", "c"),
+    entry("Move", "m"),
+    entry("Delete", "d"),
+    entry("Export", "e"),
+    sep(),
+    entry("Quit", "q"),
+];
+
+static VIEW_MENU: [MenuEntry; 3] = [
+    entry("Metadata", "i"),
+    entry("Statistics", "s"),
+    entry("Search", "/"),
+];
+
+static TOOLS_MENU: [MenuEntry; 3] = [
+    entry("Refresh", "r"),
+    sep(),
+    entry("Palette", "Ctrl+P"),
+];
+
+static HELP_MENU: [MenuEntry; 2] = [
+    entry("Keybindings", "F1"),
+    entry("About rdb", ""),
+];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ActivePane {
@@ -99,6 +158,58 @@ pub struct PalettePopup {
     pub selected: usize,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum InfoTab {
+    Schema,
+    Statistics,
+    Metadata,
+}
+
+impl InfoTab {
+    pub const ALL: [InfoTab; 3] = [InfoTab::Schema, InfoTab::Statistics, InfoTab::Metadata];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            InfoTab::Schema => "Schema",
+            InfoTab::Statistics => "Statistics",
+            InfoTab::Metadata => "Metadata",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SearchMode {
+    Input,
+    Results,
+}
+
+pub struct SearchState {
+    pub mode: SearchMode,
+    pub input: String,
+    pub cursor: usize,
+    pub results: Option<SearchResults>,
+    pub result_offset: usize,
+}
+
+pub struct ExportPopup {
+    pub input: String,
+    pub cursor: usize,
+}
+
+#[derive(Clone)]
+pub struct SortState {
+    pub col_index: usize,
+    pub col_name: String,
+    pub ascending: bool,
+    pub indices: Vec<usize>,
+}
+
+pub struct InfoPopup {
+    pub title: String,
+    pub lines: Vec<String>,
+    pub scroll: usize,
+}
+
 pub struct LoadedParquet {
     pub path: PathBuf,
     pub schema_lines: Vec<String>,
@@ -112,6 +223,9 @@ pub struct LoadedParquet {
     pub cache_col_start: usize,
     pub cache_columns: Vec<String>,
     pub cache_rows: Vec<Vec<String>>,
+    pub stats_lines: Option<Vec<String>>,
+    pub metadata_lines: Option<Vec<String>>,
+    pub sort_state: Option<SortState>,
 }
 
 pub struct PreviewRender {
@@ -140,18 +254,27 @@ pub struct App {
     pub palette_theme: PaletteTheme,
     pub file_action_popup: Option<FileActionPopup>,
     pub palette_popup: Option<PalettePopup>,
-    pub file_menu_open: bool,
+    pub open_menu: Option<OpenMenu>,
+    pub menu_selected: usize,
     delete_armed: Option<(PathBuf, Instant)>,
     last_file_click: Option<(usize, Instant)>,
     mouse_regions: Option<MouseRegions>,
-    top_menu_regions: Option<[(TopMenuTarget, Rect); 4]>,
-    file_menu_quit_region: Option<Rect>,
+    top_menu_regions: Option<[(OpenMenu, Rect); 4]>,
+    menu_item_regions: Vec<Rect>,
     quit_requested: bool,
+    info_tab_regions: Vec<(InfoTab, Rect)>,
+    pub info_tab: InfoTab,
+    pub info_scroll: usize,
+    pub search_state: Option<SearchState>,
+    pub export_popup: Option<ExportPopup>,
+    pub info_popup: Option<InfoPopup>,
+    palette_item_regions: Vec<Rect>,
+    header_col_regions: Vec<(usize, Rect)>, // (absolute col_index, rect)
 }
 
 impl App {
     pub fn new(root: PathBuf) -> anyhow::Result<Self> {
-        let palette_theme = PaletteTheme::MainframeGreen;
+        let palette_theme = Self::load_palette_theme_setting();
         let mut app = Self {
             root,
             explorer_root: PathBuf::new(),
@@ -174,13 +297,22 @@ impl App {
             palette_theme,
             file_action_popup: None,
             palette_popup: None,
-            file_menu_open: false,
+            open_menu: None,
+            menu_selected: 0,
             delete_armed: None,
             last_file_click: None,
             mouse_regions: None,
             top_menu_regions: None,
-            file_menu_quit_region: None,
+            menu_item_regions: Vec::new(),
             quit_requested: false,
+            info_tab_regions: Vec::new(),
+            info_tab: InfoTab::Schema,
+            info_scroll: 0,
+            search_state: None,
+            export_popup: None,
+            info_popup: None,
+            palette_item_regions: Vec::new(),
+            header_col_regions: Vec::new(),
         };
         app.explorer_root = app.root.clone();
         app.explorer_expanded_dirs.insert(app.explorer_root.clone());
@@ -438,17 +570,28 @@ impl App {
         self.top_menu_regions = None;
     }
 
-    pub fn clear_file_menu_regions(&mut self) {
-        self.file_menu_quit_region = None;
+    pub fn clear_menu_item_regions(&mut self) {
+        self.menu_item_regions.clear();
     }
 
-    pub fn update_file_menu_quit_region(&mut self, region: (u16, u16, u16, u16)) {
-        self.file_menu_quit_region = Some(Rect {
-            x: region.0,
-            y: region.1,
-            width: region.2,
-            height: region.3,
-        });
+    pub fn set_palette_item_regions(&mut self, regions: Vec<(u16, u16, u16, u16)>) {
+        self.palette_item_regions = regions
+            .into_iter()
+            .map(|(x, y, w, h)| Rect { x, y, width: w, height: h })
+            .collect();
+    }
+
+    fn palette_item_at(&self, x: u16, y: u16) -> Option<usize> {
+        self.palette_item_regions
+            .iter()
+            .position(|rect| rect.contains(x, y))
+    }
+
+    pub fn set_menu_item_regions(&mut self, regions: Vec<(u16, u16, u16, u16)>) {
+        self.menu_item_regions = regions
+            .into_iter()
+            .map(|(x, y, w, h)| Rect { x, y, width: w, height: h })
+            .collect();
     }
 
     pub fn update_top_menu_regions(
@@ -460,7 +603,7 @@ impl App {
     ) {
         self.top_menu_regions = Some([
             (
-                TopMenuTarget::File,
+                OpenMenu::File,
                 Rect {
                     x: file.0,
                     y: file.1,
@@ -469,7 +612,7 @@ impl App {
                 },
             ),
             (
-                TopMenuTarget::View,
+                OpenMenu::View,
                 Rect {
                     x: view.0,
                     y: view.1,
@@ -478,7 +621,7 @@ impl App {
                 },
             ),
             (
-                TopMenuTarget::Tools,
+                OpenMenu::Tools,
                 Rect {
                     x: tools.0,
                     y: tools.1,
@@ -487,7 +630,7 @@ impl App {
                 },
             ),
             (
-                TopMenuTarget::Help,
+                OpenMenu::Help,
                 Rect {
                     x: help.0,
                     y: help.1,
@@ -533,24 +676,90 @@ impl App {
         });
     }
 
-    pub fn handle_file_menu_key(&mut self, key: KeyEvent) -> bool {
-        if !self.file_menu_open {
-            return false;
-        }
+    pub fn handle_menu_key(&mut self, key: KeyEvent) -> anyhow::Result<bool> {
+        let Some(menu) = self.open_menu else {
+            return Ok(false);
+        };
 
+        let items = menu.items();
         match key.code {
             KeyCode::Esc => {
-                self.file_menu_open = false;
-                self.set_status("File menu closed");
+                self.open_menu = None;
+                self.set_status("Menu closed");
             }
-            KeyCode::Enter | KeyCode::Char('q') => {
-                self.file_menu_open = false;
-                self.request_quit();
+            KeyCode::Up => {
+                self.menu_move(-1, items);
             }
-            _ => return false,
+            KeyCode::Down => {
+                self.menu_move(1, items);
+            }
+            KeyCode::Left => {
+                let next = match menu {
+                    OpenMenu::File => OpenMenu::Help,
+                    OpenMenu::View => OpenMenu::File,
+                    OpenMenu::Tools => OpenMenu::View,
+                    OpenMenu::Help => OpenMenu::Tools,
+                };
+                self.open_menu = Some(next);
+                self.menu_selected = 0;
+            }
+            KeyCode::Right => {
+                let next = match menu {
+                    OpenMenu::File => OpenMenu::View,
+                    OpenMenu::View => OpenMenu::Tools,
+                    OpenMenu::Tools => OpenMenu::Help,
+                    OpenMenu::Help => OpenMenu::File,
+                };
+                self.open_menu = Some(next);
+                self.menu_selected = 0;
+            }
+            KeyCode::Enter => {
+                let label = items.get(self.menu_selected).map(|e| e.label);
+                self.open_menu = None;
+                if let Some(label) = label {
+                    self.execute_menu_item(label)?;
+                }
+            }
+            _ => return Ok(false),
         }
+        Ok(true)
+    }
 
-        true
+    fn menu_move(&mut self, dir: isize, items: &[MenuEntry]) {
+        if items.is_empty() {
+            return;
+        }
+        let len = items.len() as isize;
+        let mut pos = self.menu_selected as isize + dir;
+        // wrap and skip separators
+        for _ in 0..len {
+            pos = pos.rem_euclid(len);
+            if !items[pos as usize].is_separator {
+                break;
+            }
+            pos += dir;
+        }
+        self.menu_selected = pos.rem_euclid(len) as usize;
+    }
+
+    fn execute_menu_item(&mut self, label: &str) -> anyhow::Result<()> {
+        match label {
+            "Rename" => self.open_file_action(FileActionKind::Rename),
+            "Copy" => self.open_file_action(FileActionKind::Copy),
+            "Move" => self.open_file_action(FileActionKind::Move),
+            "Delete" => self.arm_or_delete_selected()?,
+            "Export" => self.open_export_popup(),
+            "Quit" => self.request_quit(),
+            "Metadata" => self.switch_info_tab(InfoTab::Metadata)?,
+            "Statistics" => self.switch_info_tab(InfoTab::Statistics)?,
+            "Search" => self.open_search(),
+            "Palette" => self.open_palette_popup(),
+            "Refresh" => self.rescan_files()?,
+            "Keybindings" => self.open_keybindings_popup(),
+            "About rdb" => self.open_about_popup(),
+            _ => {}
+        }
+        Ok(())
     }
 
     pub fn consume_quit_requested(&mut self) -> bool {
@@ -609,6 +818,8 @@ impl App {
         let meta = load_parquet_meta(&path)
             .with_context(|| format!("unable to load {}", path.display()))?;
         self.loaded = Some(LoadedParquet::from_meta(path, meta));
+        self.info_tab = InfoTab::Schema;
+        self.info_scroll = 0;
         self.ensure_preview_cache(true)?;
 
         if let Some(loaded) = &self.loaded {
@@ -800,7 +1011,7 @@ impl App {
     }
 
     pub fn open_palette_popup(&mut self) {
-        self.file_menu_open = false;
+        self.open_menu = None;
         self.palette_popup = Some(PalettePopup {
             selected: self.palette_theme.index(),
         });
@@ -852,7 +1063,30 @@ impl App {
         terminal_width: u16,
         terminal_height: u16,
     ) -> anyhow::Result<()> {
-        if self.file_action_popup.is_some() || self.palette_popup.is_some() {
+        if self.file_action_popup.is_some() {
+            return Ok(());
+        }
+
+        // Handle palette popup mouse clicks
+        if self.palette_popup.is_some() {
+            if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) {
+                if let Some(idx) = self.palette_item_at(mouse.column, mouse.row) {
+                    if idx < PaletteTheme::ALL.len() {
+                        let theme = PaletteTheme::from_index(idx);
+                        self.apply_palette(theme);
+                        self.palette_popup = None;
+                    }
+                }
+            } else if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                // Highlight on mouse down
+                if let Some(idx) = self.palette_item_at(mouse.column, mouse.row) {
+                    if idx < PaletteTheme::ALL.len() {
+                        if let Some(popup) = self.palette_popup.as_mut() {
+                            popup.selected = idx;
+                        }
+                    }
+                }
+            }
             return Ok(());
         }
 
@@ -860,21 +1094,25 @@ impl App {
             mouse.kind,
             MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left)
         ) {
-            if let Some(quit_region) = self.file_menu_quit_region {
-                if quit_region.contains(mouse.column, mouse.row) {
+            // Check clicks on menu dropdown items
+            if self.open_menu.is_some() {
+                if let Some(idx) = self.menu_item_at(mouse.column, mouse.row) {
                     if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) {
-                        self.file_menu_open = false;
-                        self.request_quit();
+                        let menu = self.open_menu.unwrap();
+                        let items = menu.items();
+                        if let Some(entry) = items.get(idx) {
+                            if !entry.is_separator {
+                                let label = entry.label;
+                                self.open_menu = None;
+                                self.execute_menu_item(label)?;
+                            }
+                        }
                     }
                     return Ok(());
                 }
             }
-        }
 
-        if matches!(
-            mouse.kind,
-            MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left)
-        ) {
+            // Check clicks on top menu bar labels
             if let Some(target) = self.top_menu_target_at(mouse.column, mouse.row) {
                 if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) {
                     self.apply_top_menu_action(target);
@@ -882,8 +1120,25 @@ impl App {
                 return Ok(());
             }
 
-            if self.file_menu_open && matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) {
-                self.file_menu_open = false;
+            // Click outside open menu closes it
+            if self.open_menu.is_some() && matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) {
+                self.open_menu = None;
+            }
+
+            // Info tab clicks
+            if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) {
+                if let Some(tab) = self.info_tab_at(mouse.column, mouse.row) {
+                    self.switch_info_tab(tab)?;
+                    return Ok(());
+                }
+            }
+
+            // Column header clicks (sort)
+            if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) {
+                if let Some(col_index) = self.header_col_at(mouse.column, mouse.row) {
+                    self.toggle_sort_column(col_index)?;
+                    return Ok(());
+                }
             }
         }
 
@@ -982,13 +1237,6 @@ impl App {
         Ok(())
     }
 
-    pub fn schema_lines_for_render(&self) -> Vec<String> {
-        self.loaded.as_ref().map_or_else(
-            || vec!["Press Enter on a parquet file to load schema".to_string()],
-            |loaded| loaded.schema_lines.clone(),
-        )
-    }
-
     pub fn build_preview_render(&self, visible_rows: usize, visible_cols: usize) -> PreviewRender {
         let Some(loaded) = &self.loaded else {
             return PreviewRender {
@@ -1050,6 +1298,93 @@ impl App {
         }
     }
 
+    // ------------------------------------------------------------------
+    // Sort
+    // ------------------------------------------------------------------
+
+    pub fn toggle_sort_column(&mut self, col_index: usize) -> anyhow::Result<()> {
+        let Some(loaded) = &self.loaded else {
+            self.set_status("Load a parquet file first");
+            return Ok(());
+        };
+        if col_index >= loaded.total_cols {
+            return Ok(());
+        }
+
+        let path = loaded.path.clone();
+
+        // Cycle: none → ascending → descending → none
+        if let Some(sort) = &loaded.sort_state {
+            if sort.col_index == col_index {
+                if sort.ascending {
+                    // Switch to descending
+                    let indices = compute_sort_indices(&path, col_index, true)?;
+                    let col_name = sort.col_name.clone();
+                    if let Some(loaded) = self.loaded.as_mut() {
+                        loaded.sort_state = Some(SortState {
+                            col_index,
+                            col_name: col_name.clone(),
+                            ascending: false,
+                            indices,
+                        });
+                    }
+                    self.set_status(format!("Sorted by {col_name} (descending)"));
+                } else {
+                    // Clear sort
+                    if let Some(loaded) = self.loaded.as_mut() {
+                        loaded.sort_state = None;
+                    }
+                    self.set_status("Sort cleared");
+                }
+                self.ensure_preview_cache(true)?;
+                return Ok(());
+            }
+        }
+
+        // New column or no sort — ascending
+        let col_name = loaded
+            .schema_lines
+            .get(col_index)
+            .map(|line| line.split(':').next().unwrap_or("?").to_string())
+            .unwrap_or_else(|| format!("col{col_index}"));
+
+        let indices = compute_sort_indices(&path, col_index, false)?;
+        if let Some(loaded) = self.loaded.as_mut() {
+            loaded.sort_state = Some(SortState {
+                col_index,
+                col_name: col_name.clone(),
+                ascending: true,
+                indices,
+            });
+        }
+        self.set_status(format!("Sorted by {col_name} (ascending)"));
+        self.ensure_preview_cache(true)?;
+        Ok(())
+    }
+
+    /// Toggle sort on the leftmost visible column (keyboard shortcut).
+    pub fn toggle_sort_current_column(&mut self) -> anyhow::Result<()> {
+        let col_index = self
+            .loaded
+            .as_ref()
+            .map(|l| l.col_offset)
+            .unwrap_or(0);
+        self.toggle_sort_column(col_index)
+    }
+
+    pub fn set_header_col_regions(&mut self, regions: Vec<(usize, u16, u16, u16, u16)>) {
+        self.header_col_regions = regions
+            .into_iter()
+            .map(|(col, x, y, w, h)| (col, Rect { x, y, width: w, height: h }))
+            .collect();
+    }
+
+    fn header_col_at(&self, x: u16, y: u16) -> Option<usize> {
+        self.header_col_regions
+            .iter()
+            .find_map(|(col, rect)| rect.contains(x, y).then_some(*col))
+    }
+
     pub fn current_status_line(&self, width: usize) -> String {
         let selected = self
             .selected_file()
@@ -1098,10 +1433,526 @@ impl App {
         }
     }
 
+    // ------------------------------------------------------------------
+    // Info panel tabs (Schema / Statistics / Metadata)
+    // ------------------------------------------------------------------
+
+    pub fn switch_info_tab(&mut self, tab: InfoTab) -> anyhow::Result<()> {
+        if self.info_tab == tab {
+            return Ok(());
+        }
+        self.info_tab = tab;
+        self.info_scroll = 0;
+        self.ensure_info_tab_data()?;
+        Ok(())
+    }
+
+    pub fn ensure_info_tab_data(&mut self) -> anyhow::Result<()> {
+        let Some(loaded) = &self.loaded else {
+            return Ok(());
+        };
+        let path = loaded.path.clone();
+
+        match self.info_tab {
+            InfoTab::Schema => {} // always available
+            InfoTab::Statistics => {
+                if loaded.stats_lines.is_none() {
+                    let stats = compute_column_statistics(&path)?;
+                    let lines = Self::format_stats_lines(&stats);
+                    if let Some(loaded) = self.loaded.as_mut() {
+                        loaded.stats_lines = Some(lines);
+                    }
+                }
+            }
+            InfoTab::Metadata => {
+                if loaded.metadata_lines.is_none() {
+                    let info = load_parquet_file_info(&path)?;
+                    let lines = Self::format_metadata_lines(&info);
+                    if let Some(loaded) = self.loaded.as_mut() {
+                        loaded.metadata_lines = Some(lines);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn set_info_tab_regions(&mut self, regions: Vec<(InfoTab, u16, u16, u16, u16)>) {
+        self.info_tab_regions = regions
+            .into_iter()
+            .map(|(tab, x, y, w, h)| (tab, Rect { x, y, width: w, height: h }))
+            .collect();
+    }
+
+    fn info_tab_at(&self, x: u16, y: u16) -> Option<InfoTab> {
+        self.info_tab_regions
+            .iter()
+            .find_map(|(tab, rect)| rect.contains(x, y).then_some(*tab))
+    }
+
+    pub fn scroll_info_panel(&mut self, delta: isize) {
+        let new = self.info_scroll as isize + delta;
+        self.info_scroll = new.max(0) as usize;
+    }
+
+    pub fn info_lines_for_render(&self) -> Vec<String> {
+        let Some(loaded) = &self.loaded else {
+            return vec!["Press Enter on a parquet file to load".to_string()];
+        };
+        match self.info_tab {
+            InfoTab::Schema => loaded.schema_lines.clone(),
+            InfoTab::Statistics => loaded
+                .stats_lines
+                .clone()
+                .unwrap_or_else(|| vec!["Press 's' or click Statistics tab to load".to_string()]),
+            InfoTab::Metadata => loaded
+                .metadata_lines
+                .clone()
+                .unwrap_or_else(|| vec!["Press 'i' or click Metadata tab to load".to_string()]),
+        }
+    }
+
+    fn format_stats_lines(stats: &[ColumnStatistics]) -> Vec<String> {
+        let mut lines = Vec::new();
+        lines.push(format!(
+            " {:20} {:12} {:>8} {:>8} {:>14} {:>14} {:>14}",
+            "Column", "Type", "Total", "Nulls", "Min", "Max", "Mean"
+        ));
+        lines.push("-".repeat(100));
+        for stat in stats {
+            lines.push(format!(
+                " {:20} {:12} {:>8} {:>8} {:>14} {:>14} {:>14}",
+                truncate_str(&stat.name, 20),
+                truncate_str(&stat.dtype, 12),
+                stat.total_count,
+                stat.null_count,
+                truncate_str(&stat.min_value, 14),
+                truncate_str(&stat.max_value, 14),
+                truncate_str(&stat.mean_value, 14),
+            ));
+        }
+        lines
+    }
+
+    fn format_metadata_lines(info: &ParquetFileInfo) -> Vec<String> {
+        let mut lines = Vec::new();
+        lines.push(format!(
+            "File size: {} bytes ({:.2} MB)",
+            info.file_size_bytes,
+            info.file_size_bytes as f64 / 1_048_576.0
+        ));
+        lines.push(format!("Created by: {}", info.created_by));
+        lines.push(format!("Row groups: {}", info.num_row_groups));
+        lines.push(String::new());
+
+        for rg in &info.row_groups {
+            lines.push(format!(
+                "--- Row Group {} ---  rows: {}  size: {} bytes ({:.2} MB)",
+                rg.index,
+                rg.num_rows,
+                rg.total_byte_size,
+                rg.total_byte_size as f64 / 1_048_576.0,
+            ));
+            for col in &rg.columns {
+                let ratio = if col.uncompressed_size > 0 {
+                    col.compressed_size as f64 / col.uncompressed_size as f64
+                } else {
+                    0.0
+                };
+                lines.push(format!(
+                    "  {}: {} | {}/{} bytes (ratio {:.2})",
+                    col.name, col.compression, col.compressed_size, col.uncompressed_size, ratio,
+                ));
+            }
+            lines.push(String::new());
+        }
+        lines
+    }
+
+    // ------------------------------------------------------------------
+    // Search / filter
+    // ------------------------------------------------------------------
+
+    pub fn open_search(&mut self) {
+        if self.loaded.is_none() {
+            self.set_status("Load a parquet file first");
+            return;
+        }
+        self.search_state = Some(SearchState {
+            mode: SearchMode::Input,
+            input: String::new(),
+            cursor: 0,
+            results: None,
+            result_offset: 0,
+        });
+    }
+
+    pub fn handle_search_key(&mut self, key: KeyEvent) -> anyhow::Result<bool> {
+        let Some(state) = self.search_state.as_mut() else {
+            return Ok(false);
+        };
+
+        match state.mode {
+            SearchMode::Input => match key.code {
+                KeyCode::Esc => {
+                    self.search_state = None;
+                    self.set_status("Search cancelled");
+                }
+                KeyCode::Enter => {
+                    if state.input.trim().is_empty() {
+                        self.search_state = None;
+                        self.set_status("Search cleared");
+                        return Ok(true);
+                    }
+                    let query = state.input.clone();
+                    self.execute_search(&query)?;
+                }
+                KeyCode::Backspace => {
+                    if state.cursor > 0 {
+                        let from = char_to_byte_index(&state.input, state.cursor - 1);
+                        let to = char_to_byte_index(&state.input, state.cursor);
+                        state.input.replace_range(from..to, "");
+                        state.cursor -= 1;
+                    }
+                }
+                KeyCode::Left => {
+                    state.cursor = state.cursor.saturating_sub(1);
+                }
+                KeyCode::Right => {
+                    state.cursor = cmp::min(state.cursor + 1, state.input.chars().count());
+                }
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    let byte_idx = char_to_byte_index(&state.input, state.cursor);
+                    state.input.insert(byte_idx, c);
+                    state.cursor += 1;
+                }
+                _ => return Ok(false),
+            },
+            SearchMode::Results => match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    self.search_state = None;
+                    self.set_status("Search cleared");
+                }
+                KeyCode::Char('/') => {
+                    if let Some(state) = self.search_state.as_mut() {
+                        state.mode = SearchMode::Input;
+                        state.input.clear();
+                        state.cursor = 0;
+                    }
+                }
+                KeyCode::Up => {
+                    state.result_offset = state.result_offset.saturating_sub(1);
+                }
+                KeyCode::Down => {
+                    state.result_offset = state.result_offset.saturating_add(1);
+                }
+                KeyCode::PageUp => {
+                    state.result_offset = state.result_offset.saturating_sub(20);
+                }
+                KeyCode::PageDown => {
+                    state.result_offset = state.result_offset.saturating_add(20);
+                }
+                KeyCode::Home => {
+                    state.result_offset = 0;
+                }
+                KeyCode::Left => {
+                    // handled later if we add col scrolling for search results
+                }
+                KeyCode::Right => {}
+                KeyCode::Char('e') => {
+                    self.open_export_from_search();
+                    return Ok(true);
+                }
+                _ => return Ok(false),
+            },
+        }
+        Ok(true)
+    }
+
+    fn execute_search(&mut self, query: &str) -> anyhow::Result<()> {
+        let Some(loaded) = &self.loaded else {
+            return Ok(());
+        };
+        let path = loaded.path.clone();
+        self.set_status(format!("Searching for '{query}'..."));
+        let results = search_parquet_rows(&path, query, CELL_CHAR_LIMIT)?;
+        let count = results.matching_rows.len();
+        let capped = results.capped;
+        let msg = if capped {
+            format!("Found {count}+ matches for '{query}' (capped)")
+        } else {
+            format!("Found {count} matches for '{query}'")
+        };
+        if let Some(state) = self.search_state.as_mut() {
+            state.mode = SearchMode::Results;
+            state.results = Some(results);
+            state.result_offset = 0;
+        }
+        self.set_status(msg);
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Export / write parquet
+    // ------------------------------------------------------------------
+
+    pub fn open_export_popup(&mut self) {
+        let Some(loaded) = &self.loaded else {
+            self.set_status("Load a parquet file first");
+            return;
+        };
+        let source_rel = self.display_path(&loaded.path);
+        let default = format!("{source_rel}.export.parquet");
+        self.export_popup = Some(ExportPopup {
+            cursor: default.chars().count(),
+            input: default,
+        });
+    }
+
+    fn open_export_from_search(&mut self) {
+        let Some(loaded) = &self.loaded else {
+            return;
+        };
+        let source_rel = self.display_path(&loaded.path);
+        let default = format!("{source_rel}.filtered.parquet");
+        self.export_popup = Some(ExportPopup {
+            cursor: default.chars().count(),
+            input: default,
+        });
+    }
+
+    // ------------------------------------------------------------------
+    // Info popup (Keybindings / About)
+    // ------------------------------------------------------------------
+
+    pub fn open_keybindings_popup(&mut self) {
+        self.info_popup = Some(InfoPopup {
+            title: "Keybindings".to_string(),
+            lines: vec![
+                "Navigation".to_string(),
+                "  Tab            Switch pane (Files / Preview)".to_string(),
+                "  Up/Down        Move selection / scroll rows".to_string(),
+                "  Left/Right     Collapse/expand dir, scroll columns".to_string(),
+                "  Ctrl+Left/Right  Scroll columns by 5".to_string(),
+                "  PageUp/PageDown  Page through rows".to_string(),
+                "  Shift+Up/Down  Scroll info panel".to_string(),
+                "  Enter          Open/toggle selected entry".to_string(),
+                "  Backspace      Collapse directory or go to parent".to_string(),
+                String::new(),
+                "Info Tabs".to_string(),
+                "  1              Schema tab".to_string(),
+                "  2              Statistics tab".to_string(),
+                "  3              Metadata tab".to_string(),
+                "  i              Switch to Metadata tab".to_string(),
+                "  s              Switch to Statistics tab".to_string(),
+                String::new(),
+                "File Operations".to_string(),
+                "  n              Rename file".to_string(),
+                "  c              Copy file".to_string(),
+                "  m              Move file".to_string(),
+                "  d              Delete file (press twice)".to_string(),
+                "  e              Export parquet".to_string(),
+                String::new(),
+                "Sort".to_string(),
+                "  o              Sort by leftmost column (asc/desc/none)".to_string(),
+                "  Click header   Sort by clicked column".to_string(),
+                String::new(),
+                "Search & Tools".to_string(),
+                "  /              Search in parquet data".to_string(),
+                "  r              Refresh file list".to_string(),
+                "  Ctrl+P         Open palette".to_string(),
+                String::new(),
+                "General".to_string(),
+                "  F1             This help".to_string(),
+                "  q / Ctrl+Q     Quit".to_string(),
+                "  Esc            Close popup/menu".to_string(),
+            ],
+            scroll: 0,
+        });
+    }
+
+    pub fn open_about_popup(&mut self) {
+        self.info_popup = Some(InfoPopup {
+            title: "About rdb".to_string(),
+            lines: vec![
+                "rdb v0.1".to_string(),
+                String::new(),
+                "A terminal-based Parquet file explorer and viewer.".to_string(),
+                String::new(),
+                "Built with Ratatui, Polars, and Apache Parquet.".to_string(),
+                String::new(),
+                "Features:".to_string(),
+                "  - Browse and inspect parquet files".to_string(),
+                "  - View schema, statistics, and metadata".to_string(),
+                "  - Search/filter rows across all columns".to_string(),
+                "  - Export filtered or full data".to_string(),
+                "  - File operations (rename, copy, move, delete)".to_string(),
+                "  - Multiple color themes".to_string(),
+            ],
+            scroll: 0,
+        });
+    }
+
+    pub fn handle_info_popup_key(&mut self, key: KeyEvent) -> bool {
+        let Some(popup) = self.info_popup.as_mut() else {
+            return false;
+        };
+
+        match key.code {
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char(' ') => {
+                self.info_popup = None;
+            }
+            KeyCode::Up => {
+                popup.scroll = popup.scroll.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                popup.scroll = popup.scroll.saturating_add(1);
+            }
+            KeyCode::PageUp => {
+                popup.scroll = popup.scroll.saturating_sub(10);
+            }
+            KeyCode::PageDown => {
+                popup.scroll = popup.scroll.saturating_add(10);
+            }
+            KeyCode::Home => {
+                popup.scroll = 0;
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    pub fn handle_export_key(&mut self, key: KeyEvent) -> anyhow::Result<bool> {
+        let Some(popup) = self.export_popup.as_mut() else {
+            return Ok(false);
+        };
+
+        match key.code {
+            KeyCode::Esc => {
+                self.export_popup = None;
+                self.set_status("Export cancelled");
+            }
+            KeyCode::Enter => {
+                self.execute_export()?;
+            }
+            KeyCode::Backspace => {
+                if popup.cursor > 0 {
+                    let from = char_to_byte_index(&popup.input, popup.cursor - 1);
+                    let to = char_to_byte_index(&popup.input, popup.cursor);
+                    popup.input.replace_range(from..to, "");
+                    popup.cursor -= 1;
+                }
+            }
+            KeyCode::Delete => {
+                if popup.cursor < popup.input.chars().count() {
+                    let from = char_to_byte_index(&popup.input, popup.cursor);
+                    let to = char_to_byte_index(&popup.input, popup.cursor + 1);
+                    popup.input.replace_range(from..to, "");
+                }
+            }
+            KeyCode::Left => {
+                popup.cursor = popup.cursor.saturating_sub(1);
+            }
+            KeyCode::Right => {
+                popup.cursor = cmp::min(popup.cursor + 1, popup.input.chars().count());
+            }
+            KeyCode::Home => {
+                popup.cursor = 0;
+            }
+            KeyCode::End => {
+                popup.cursor = popup.input.chars().count();
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                let byte_idx = char_to_byte_index(&popup.input, popup.cursor);
+                popup.input.insert(byte_idx, c);
+                popup.cursor += 1;
+            }
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    fn execute_export(&mut self) -> anyhow::Result<()> {
+        let Some(popup) = self.export_popup.take() else {
+            return Ok(());
+        };
+        let Some(loaded) = &self.loaded else {
+            return Ok(());
+        };
+
+        let source = loaded.path.clone();
+        let dest = self.resolve_target_path(&popup.input)?;
+
+        // If search filter is active, export only matching rows
+        let row_indices: Option<Vec<usize>> = self
+            .search_state
+            .as_ref()
+            .and_then(|s| s.results.as_ref())
+            .map(|r| r.matching_rows.iter().map(|(idx, _)| *idx).collect());
+
+        let rows_written =
+            export_parquet(&source, &dest, row_indices.as_deref())?;
+        self.rescan_files()?;
+        self.set_status(format!(
+            "Exported {} rows to {}",
+            rows_written,
+            self.display_path(&dest)
+        ));
+        Ok(())
+    }
+
     fn apply_palette(&mut self, palette_theme: PaletteTheme) {
         self.palette_theme = palette_theme;
         self.theme = palette_theme.theme();
-        self.set_status(format!("Palette applied: {}", palette_theme.name()));
+        match Self::save_palette_theme_setting(palette_theme) {
+            Ok(()) => {
+                self.set_status(format!("Palette changed to {}.", palette_theme.name()));
+            }
+            Err(err) => {
+                self.set_status(format!(
+                    "Palette changed to {} (settings not saved: {err}).",
+                    palette_theme.name()
+                ));
+            }
+        }
+    }
+
+    fn load_palette_theme_setting() -> PaletteTheme {
+        let Some(path) = Self::settings_path() else {
+            return PaletteTheme::MainframeGreen;
+        };
+        let Ok(contents) = fs::read_to_string(path) else {
+            return PaletteTheme::MainframeGreen;
+        };
+        contents
+            .lines()
+            .find_map(|line| {
+                let (key, value) = line.split_once('=')?;
+                if key.trim() != "palette" {
+                    return None;
+                }
+                PaletteTheme::from_settings_value(value.trim())
+            })
+            .unwrap_or(PaletteTheme::MainframeGreen)
+    }
+
+    fn save_palette_theme_setting(theme: PaletteTheme) -> std::io::Result<()> {
+        let Some(path) = Self::settings_path() else {
+            return Ok(());
+        };
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(path, format!("palette={}\n", theme.settings_value()))
+    }
+
+    fn settings_path() -> Option<PathBuf> {
+        if let Some(path) = env::var_os("XDG_CONFIG_HOME") {
+            return Some(PathBuf::from(path).join(APP_NAME).join(SETTINGS_FILE));
+        }
+        env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|home| home.join(".config").join(APP_NAME).join(SETTINGS_FILE))
     }
 
     fn open_explorer_parent(&mut self) {
@@ -1120,7 +1971,7 @@ impl App {
         self.set_status("Quit requested");
     }
 
-    fn top_menu_target_at(&self, x: u16, y: u16) -> Option<TopMenuTarget> {
+    fn top_menu_target_at(&self, x: u16, y: u16) -> Option<OpenMenu> {
         self.top_menu_regions.and_then(|regions| {
             regions
                 .iter()
@@ -1128,34 +1979,18 @@ impl App {
         })
     }
 
-    fn apply_top_menu_action(&mut self, target: TopMenuTarget) {
-        match target {
-            TopMenuTarget::File => {
-                self.active_pane = ActivePane::Files;
-                self.file_menu_open = !self.file_menu_open;
-                if self.file_menu_open {
-                    self.set_status("File menu: Enter or click Quit");
-                } else {
-                    self.set_status(
-                        "Files: Enter open/toggle | Left collapse | Right expand | n/c/m/d parquet ops",
-                    );
-                }
-            }
-            TopMenuTarget::View => {
-                self.file_menu_open = false;
-                self.active_pane = ActivePane::Preview;
-                self.set_status("View: preview focused (Left/Right cols, Up/Down rows)");
-            }
-            TopMenuTarget::Tools => {
-                self.file_menu_open = false;
-                self.open_palette_popup();
-            }
-            TopMenuTarget::Help => {
-                self.file_menu_open = false;
-                self.set_status(
-                    "Help: Tab pane | Enter load | Ctrl+P palette | n/c/m/d file ops | q quit",
-                );
-            }
+    fn menu_item_at(&self, x: u16, y: u16) -> Option<usize> {
+        self.menu_item_regions
+            .iter()
+            .position(|rect| rect.contains(x, y))
+    }
+
+    fn apply_top_menu_action(&mut self, target: OpenMenu) {
+        if self.open_menu == Some(target) {
+            self.open_menu = None;
+        } else {
+            self.open_menu = Some(target);
+            self.menu_selected = 0;
         }
     }
 
@@ -1300,7 +2135,7 @@ impl App {
             return Ok(());
         }
 
-        let (path, row_start, row_count, projection) = {
+        let (path, row_start, row_count, projection, sorted_row_indices) = {
             let loaded = self.loaded.as_mut().expect("loaded exists");
             let row_window = cmp::max(DEFAULT_ROW_WINDOW, loaded.viewport_rows.saturating_mul(3));
             let col_window = cmp::max(DEFAULT_COL_WINDOW, loaded.viewport_cols.saturating_add(6));
@@ -1317,12 +2152,23 @@ impl App {
             let col_count = cmp::min(col_window, loaded.total_cols.saturating_sub(col_start));
             let projection = (col_start..col_start + col_count).collect::<Vec<_>>();
 
-            (loaded.path.clone(), row_start, row_count, projection)
+            let sorted_row_indices = loaded.sort_state.as_ref().map(|sort| {
+                let end = cmp::min(row_start + row_count, sort.indices.len());
+                sort.indices[row_start..end].to_vec()
+            });
+
+            (loaded.path.clone(), row_start, row_count, projection, sorted_row_indices)
         };
 
-        let slice =
+        let slice = if let Some(row_indices) = sorted_row_indices {
+            let mut s = load_parquet_rows(&path, &row_indices, &projection, CELL_CHAR_LIMIT)
+                .with_context(|| format!("unable to read sorted preview for {}", path.display()))?;
+            s.row_start = row_start;
+            s
+        } else {
             load_parquet_slice(&path, row_start, row_count, &projection, CELL_CHAR_LIMIT)
-                .with_context(|| format!("unable to read preview window for {}", path.display()))?;
+                .with_context(|| format!("unable to read preview window for {}", path.display()))?
+        };
 
         if let Some(loaded) = self.loaded.as_mut() {
             loaded.cache_row_start = slice.row_start;
@@ -1367,6 +2213,9 @@ impl LoadedParquet {
             cache_col_start: 0,
             cache_columns: Vec::new(),
             cache_rows: Vec::new(),
+            stats_lines: None,
+            metadata_lines: None,
+            sort_state: None,
         }
     }
 }
@@ -1377,6 +2226,10 @@ fn char_to_byte_index(value: &str, char_idx: usize) -> usize {
         .nth(char_idx)
         .map(|(idx, _)| idx)
         .unwrap_or(value.len())
+}
+
+fn truncate_str(s: &str, max: usize) -> String {
+    s.chars().take(max).collect()
 }
 
 fn pad_or_clip(text: &str, width: usize) -> String {

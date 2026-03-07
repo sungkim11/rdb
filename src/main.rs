@@ -63,12 +63,32 @@ fn run_app(
                     continue;
                 }
 
+                // Popups consume keys first (priority order)
+                if app.info_popup.is_some() {
+                    app.handle_info_popup_key(key);
+                    continue;
+                }
+
+                if app.export_popup.is_some() {
+                    let result = app.handle_export_key(key);
+                    app.apply_result(result.map(|_| ()));
+                    continue;
+                }
+
+                if app.search_state.is_some() {
+                    let result = app.handle_search_key(key);
+                    app.apply_result(result.map(|_| ()));
+                    continue;
+                }
+
                 if app.palette_popup.is_some() {
                     app.handle_palette_key(key);
                     continue;
                 }
 
-                if app.file_menu_open && app.handle_file_menu_key(key) {
+                if app.open_menu.is_some() {
+                    let result = app.handle_menu_key(key);
+                    app.apply_result(result.map(|_| ()));
                     if app.consume_quit_requested() {
                         break;
                     }
@@ -92,6 +112,9 @@ fn run_app(
                 }
 
                 match key.code {
+                    KeyCode::F(1) => {
+                        app.open_keybindings_popup();
+                    }
                     KeyCode::Char('q') => break,
                     KeyCode::Char('r') => {
                         let result = app.rescan_files();
@@ -107,15 +130,23 @@ fn run_app(
                     KeyCode::Up => match app.active_pane {
                         ActivePane::Files => app.move_selection(-1),
                         ActivePane::Preview => {
-                            let result = app.scroll_preview_rows(-1);
-                            app.apply_result(result);
+                            if key.modifiers.contains(KeyModifiers::SHIFT) {
+                                app.scroll_info_panel(-1);
+                            } else {
+                                let result = app.scroll_preview_rows(-1);
+                                app.apply_result(result);
+                            }
                         }
                     },
                     KeyCode::Down => match app.active_pane {
                         ActivePane::Files => app.move_selection(1),
                         ActivePane::Preview => {
-                            let result = app.scroll_preview_rows(1);
-                            app.apply_result(result);
+                            if key.modifiers.contains(KeyModifiers::SHIFT) {
+                                app.scroll_info_panel(1);
+                            } else {
+                                let result = app.scroll_preview_rows(1);
+                                app.apply_result(result);
+                            }
                         }
                     },
                     KeyCode::PageUp => {
@@ -159,6 +190,34 @@ fn run_app(
                             app.collapse_selected_directory_or_parent();
                         }
                     }
+                    // Info tab keys
+                    KeyCode::Char('i') => {
+                        let result = app.switch_info_tab(app::InfoTab::Metadata);
+                        app.apply_result(result);
+                    }
+                    KeyCode::Char('s') => {
+                        let result = app.switch_info_tab(app::InfoTab::Statistics);
+                        app.apply_result(result);
+                    }
+                    KeyCode::Char('1') => {
+                        let result = app.switch_info_tab(app::InfoTab::Schema);
+                        app.apply_result(result);
+                    }
+                    KeyCode::Char('2') => {
+                        let result = app.switch_info_tab(app::InfoTab::Statistics);
+                        app.apply_result(result);
+                    }
+                    KeyCode::Char('3') => {
+                        let result = app.switch_info_tab(app::InfoTab::Metadata);
+                        app.apply_result(result);
+                    }
+                    KeyCode::Char('/') => {
+                        app.open_search();
+                    }
+                    KeyCode::Char('e') => {
+                        app.open_export_popup();
+                    }
+                    // Existing file ops (Files pane only)
                     KeyCode::Char('n') => {
                         if app.active_pane == ActivePane::Files {
                             app.open_file_action(FileActionKind::Rename);
@@ -177,6 +236,12 @@ fn run_app(
                     KeyCode::Char('d') => {
                         if app.active_pane == ActivePane::Files {
                             let result = app.arm_or_delete_selected();
+                            app.apply_result(result);
+                        }
+                    }
+                    KeyCode::Char('o') => {
+                        if app.active_pane == ActivePane::Preview {
+                            let result = app.toggle_sort_current_column();
                             app.apply_result(result);
                         }
                     }
