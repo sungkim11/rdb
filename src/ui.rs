@@ -77,6 +77,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         draw_import_popup(frame, area, app);
     }
 
+    if app.sql_popup.is_some() {
+        draw_sql_popup(frame, area, app);
+    }
+
     if app.info_popup.is_some() {
         draw_info_popup(frame, area, app);
     }
@@ -1515,4 +1519,184 @@ fn draw_progress_popup(frame: &mut Frame, area: Rect, app: &mut App) {
         Paragraph::new(lines).style(Style::default().bg(app.theme.bg)),
         inner,
     );
+}
+
+// ---------------------------------------------------------------------------
+// SQL Query popup (DuckDB)
+// ---------------------------------------------------------------------------
+
+fn draw_sql_popup(frame: &mut Frame, area: Rect, app: &mut App) {
+    if app.sql_popup.is_none() {
+        return;
+    }
+
+    let width = cmp::min(100, area.width.saturating_sub(4));
+    let height = cmp::min(area.height.saturating_sub(4), 30);
+    if width < 40 || height < 10 {
+        return;
+    }
+
+    let rect = Rect::new(
+        (area.width.saturating_sub(width)) / 2,
+        (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    );
+
+    if let Some(popup) = app.sql_popup.as_mut() {
+        popup.rect = Some((rect.x, rect.y, rect.width, rect.height));
+    }
+
+    let popup = app.sql_popup.as_ref().unwrap();
+    let inner_width = usize::from(width.saturating_sub(2));
+
+    let label_style = Style::default().fg(app.theme.menu_fg).bg(app.theme.menu_bg);
+    let input_style = Style::default().fg(app.theme.fg).bg(app.theme.line_bg);
+    let cursor_style = Style::default()
+        .fg(app.theme.active_fg)
+        .bg(app.theme.active_bg);
+    let hint_style = Style::default().fg(app.theme.dim_fg).bg(app.theme.menu_bg);
+    let header_style = Style::default()
+        .fg(app.theme.active_fg)
+        .bg(app.theme.menu_bg)
+        .add_modifier(Modifier::BOLD);
+    let row_style = Style::default().fg(app.theme.fg).bg(app.theme.menu_bg);
+    let error_style = Style::default().fg(app.theme.active_fg).bg(app.theme.menu_bg);
+
+    let input = &popup.input;
+    let cursor = popup.cursor;
+    let before: String = input.chars().take(cursor).collect();
+    let cursor_char = input.chars().nth(cursor).unwrap_or(' ');
+    let after: String = input.chars().skip(cursor + 1).collect();
+    let after_pad_len = inner_width
+        .saturating_sub(1)
+        .saturating_sub(UnicodeWidthStr::width(before.as_str()))
+        .saturating_sub(UnicodeWidthChar::width(cursor_char).unwrap_or(1))
+        .saturating_sub(UnicodeWidthStr::width(after.as_str()));
+    let after_padded = format!("{after}{}", " ".repeat(after_pad_len));
+
+    let input_line = Line::from(vec![
+        Span::styled(" ", input_style),
+        Span::styled(before, input_style),
+        Span::styled(cursor_char.to_string(), cursor_style),
+        Span::styled(after_padded, input_style),
+    ]);
+
+    let file_label = app
+        .loaded
+        .as_ref()
+        .map(|l| format!(" Table: data  ({})", app.display_path(&l.path)))
+        .unwrap_or_else(|| " Table: data".to_string());
+
+    let mut lines = vec![
+        Line::styled(clip_or_pad(&file_label, inner_width), label_style),
+        Line::styled(clip_or_pad(" SQL:", inner_width), label_style),
+        input_line,
+    ];
+
+    if let Some(err) = &popup.error {
+        lines.push(Line::styled(
+            clip_or_pad(&format!(" Error: {err}"), inner_width),
+            error_style,
+        ));
+    }
+
+    if let Some(result) = &popup.result {
+        lines.push(Line::styled(
+            clip_or_pad(
+                &format!(
+                    " {} rows, {} columns{}",
+                    result.row_count,
+                    result.column_names.len(),
+                    if result.capped { " (capped)" } else { "" }
+                ),
+                inner_width,
+            ),
+            label_style,
+        ));
+
+        // Column layout
+        let col_offset = popup.col_offset;
+        let cell_width = 18;
+        let avail = inner_width.saturating_sub(1);
+        let visible_cols = cmp::max(avail / (cell_width + 1), 1);
+        let end_col = cmp::min(col_offset + visible_cols, result.column_names.len());
+        let visible_names = &result.column_names[col_offset..end_col];
+
+        // Header
+        let header_str: String = visible_names
+            .iter()
+            .map(|n| {
+                let s = if n.len() > cell_width {
+                    format!("{}...", &n[..cell_width - 3])
+                } else {
+                    format!("{:width$}", n, width = cell_width)
+                };
+                s
+            })
+            .collect::<Vec<_>>()
+            .join("|");
+        lines.push(Line::styled(
+            clip_or_pad(&format!(" {header_str}"), inner_width),
+            header_style,
+        ));
+
+        // Separator
+        let sep_str = visible_names
+            .iter()
+            .map(|_| "-".repeat(cell_width))
+            .collect::<Vec<_>>()
+            .join("+");
+        lines.push(Line::styled(
+            clip_or_pad(&format!(" {sep_str}"), inner_width),
+            label_style,
+        ));
+
+        // Data rows
+        let max_data_lines = height.saturating_sub(2) as usize // border
+            - lines.len()
+            - 1; // hint line
+        let scroll = popup.result_scroll;
+        let end_row = cmp::min(scroll + max_data_lines, result.rows.len());
+
+        for row in &result.rows[scroll..end_row] {
+            let row_str: String = (col_offset..end_col)
+                .map(|ci| {
+                    let cell = row.get(ci).map(|s| s.as_str()).unwrap_or("");
+                    let s = if cell.len() > cell_width {
+                        format!("{}...", &cell[..cell_width - 3])
+                    } else {
+                        format!("{:width$}", cell, width = cell_width)
+                    };
+                    s
+                })
+                .collect::<Vec<_>>()
+                .join("|");
+            lines.push(Line::styled(
+                clip_or_pad(&format!(" {row_str}"), inner_width),
+                row_style,
+            ));
+        }
+    }
+
+    lines.push(Line::styled(
+        clip_or_pad(
+            " Enter: run  Up/Down: scroll  Shift+Left/Right: columns  Esc: close",
+            inner_width,
+        ),
+        hint_style,
+    ));
+
+    let block = Block::default()
+        .title(" SQL Query (DuckDB) ")
+        .borders(Borders::ALL)
+        .border_style(
+            Style::default()
+                .fg(app.theme.panel_border)
+                .bg(app.theme.menu_bg),
+        );
+
+    frame.render_widget(Clear, rect);
+    frame.render_widget(block.clone(), rect);
+    frame.render_widget(Paragraph::new(lines), block.inner(rect));
 }

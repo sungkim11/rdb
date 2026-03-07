@@ -1,7 +1,7 @@
 # rdb
 
-`rdb` is a terminal data explorer built with Rust + Ratatui + Polars.
-It provides a multi-pane TUI with a file explorer, Parquet/CSV data preview with sorting and search, info tabs (schema, statistics, metadata), import/export, menu bar, and popup-driven workflows.
+`rdb` is a terminal data explorer built with Rust + Ratatui + Polars + DuckDB.
+It provides a multi-pane TUI with a file explorer, Parquet/CSV data preview with sorting and search, SQL queries via DuckDB, info tabs (schema, statistics, metadata), import/export, menu bar, and popup-driven workflows.
 
 ## Current Features
 
@@ -21,6 +21,10 @@ It provides a multi-pane TUI with a file explorer, Parquet/CSV data preview with
   - Prettified popup views
 - Search:
   - `Tools | Search` popup for searching within loaded data
+- SQL queries:
+  - `Tools | SQL Query` popup for running SQL against loaded data via DuckDB
+  - The loaded file is exposed as a `data` table
+  - Results displayed in a scrollable table with column navigation
 - File operations (via menu):
   - Rename, copy, move
   - Delete (double-press confirm)
@@ -145,6 +149,7 @@ Data:
 - `o`: sort by current column (asc/desc/none)
 - Click header: sort by clicked column
 - `/`: search in loaded data
+- `Ctrl+D`: SQL query (DuckDB)
 
 Info tabs:
 
@@ -192,6 +197,7 @@ cargo run -- data/sample.parquet
 Then try:
 
 1. `Tools | Palette`
-2. `Tools | Search`
-3. `File | Export to CSV`
-4. `Help | Keybindings`
+2. `Tools | SQL Query` — run `SELECT * FROM data LIMIT 100`
+3. `Tools | Search`
+4. `File | Export to CSV`
+5. `Help | Keybindings`

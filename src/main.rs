@@ -14,6 +14,7 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
 mod app;
+mod duckdb;
 mod parquet;
 mod theme;
 mod ui;
@@ -96,6 +97,12 @@ fn run_app(
                     continue;
                 }
 
+                if app.sql_popup.is_some() {
+                    let result = app.handle_sql_key(key);
+                    app.apply_result(result.map(|_| ()));
+                    continue;
+                }
+
                 if app.search_state.is_some() {
                     let result = app.handle_search_key(key);
                     app.apply_result(result.map(|_| ()));
@@ -129,6 +136,11 @@ fn run_app(
                     || (key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('t'))
                 {
                     app.open_palette_popup();
+                    continue;
+                }
+
+                if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('d') {
+                    app.open_sql_popup();
                     continue;
                 }
 
