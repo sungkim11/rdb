@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0"
 crossterm = "0.29"
+duckdb = { version = "1.4", features = ["bundled"] }
 parquet = "58.0.0"
 polars = { version = "0.51", default-features = false, features = ["parquet", "csv", "fmt"] }
 ratatui = "0.29"

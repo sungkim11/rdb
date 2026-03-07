@@ -7,6 +7,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::duckdb::{SqlResult, run_sql};
 use crate::parquet::{
     ColumnStatistics, ParquetFileInfo, ParquetMeta, SearchResults, compute_column_statistics,
     compute_csv_sort_indices, compute_sort_indices, export_csv, fit_visible_columns, import_csv,
@@ -91,8 +92,9 @@ static FILE_MENU: [MenuEntry; 4] = [
 
 static VIEW_MENU: [MenuEntry; 0] = [];
 
-static TOOLS_MENU: [MenuEntry; 5] = [
+static TOOLS_MENU: [MenuEntry; 6] = [
     entry("Search", "/"),
+    entry("SQL Query", "Ctrl+D"),
     sep(),
     entry("Refresh", "r"),
     sep(),
@@ -225,6 +227,16 @@ pub enum ImportField {
     Target,
 }
 
+pub struct SqlPopup {
+    pub input: String,
+    pub cursor: usize,
+    pub result: Option<SqlResult>,
+    pub error: Option<String>,
+    pub result_scroll: usize,
+    pub col_offset: usize,
+    pub rect: Option<(u16, u16, u16, u16)>,
+}
+
 #[derive(Clone)]
 pub struct SortState {
     pub col_index: usize,
@@ -347,6 +359,7 @@ pub struct App {
     pub search_state: Option<SearchState>,
     pub export_popup: Option<ExportPopup>,
     pub import_popup: Option<ImportPopup>,
+    pub sql_popup: Option<SqlPopup>,
     pub info_popup: Option<InfoPopup>,
     pub progress_popup: Option<ProgressPopup>,
     palette_item_regions: Vec<Rect>,
@@ -392,6 +405,7 @@ impl App {
             search_state: None,
             export_popup: None,
             import_popup: None,
+            sql_popup: None,
             info_popup: None,
             progress_popup: None,
             palette_item_regions: Vec::new(),
@@ -871,6 +885,7 @@ impl App {
             "Metadata" => self.switch_info_tab(InfoTab::Metadata)?,
             "Statistics" => self.switch_info_tab(InfoTab::Statistics)?,
             "Search" => self.open_search(),
+            "SQL Query" => self.open_sql_popup(),
             "Palette" => self.open_palette_popup(),
             "Refresh" => self.rescan_files()?,
             "Keybindings" => self.open_keybindings_popup(),
@@ -2324,6 +2339,163 @@ impl App {
     }
 
     // ------------------------------------------------------------------
+    // SQL (DuckDB) popup
+    // ------------------------------------------------------------------
+
+    pub fn open_sql_popup(&mut self) {
+        if self.loaded.is_none() {
+            self.set_status("Load a file first");
+            return;
+        }
+        self.sql_popup = Some(SqlPopup {
+            input: "SELECT * FROM data LIMIT 100".to_string(),
+            cursor: 27,
+            result: None,
+            error: None,
+            result_scroll: 0,
+            col_offset: 0,
+            rect: None,
+        });
+    }
+
+    pub fn handle_sql_key(&mut self, key: KeyEvent) -> anyhow::Result<bool> {
+        let Some(popup) = self.sql_popup.as_mut() else {
+            return Ok(false);
+        };
+
+        match key.code {
+            KeyCode::Esc => {
+                self.sql_popup = None;
+                self.set_status("SQL cancelled");
+            }
+            KeyCode::Enter => {
+                let query = popup.input.clone();
+                let path = self
+                    .loaded
+                    .as_ref()
+                    .map(|l| l.path.clone())
+                    .unwrap_or_default();
+                match run_sql(&path, &query) {
+                    Ok(result) => {
+                        let msg = if result.capped {
+                            format!("{} rows (capped at 10,000)", result.row_count)
+                        } else {
+                            format!("{} rows", result.row_count)
+                        };
+                        if let Some(popup) = self.sql_popup.as_mut() {
+                            popup.result = Some(result);
+                            popup.error = None;
+                            popup.result_scroll = 0;
+                            popup.col_offset = 0;
+                        }
+                        self.set_status(msg);
+                    }
+                    Err(e) => {
+                        if let Some(popup) = self.sql_popup.as_mut() {
+                            popup.error = Some(format!("{e:#}"));
+                            popup.result = None;
+                        }
+                    }
+                }
+            }
+            KeyCode::Left => {
+                if let Some(popup) = self.sql_popup.as_mut() {
+                    if popup.result.is_some()
+                        && key.modifiers.contains(KeyModifiers::SHIFT)
+                    {
+                        popup.col_offset = popup.col_offset.saturating_sub(1);
+                    } else {
+                        popup.cursor = popup.cursor.saturating_sub(1);
+                    }
+                }
+            }
+            KeyCode::Right => {
+                if let Some(popup) = self.sql_popup.as_mut() {
+                    if popup.result.is_some()
+                        && key.modifiers.contains(KeyModifiers::SHIFT)
+                    {
+                        let max_cols = popup
+                            .result
+                            .as_ref()
+                            .map(|r| r.column_names.len().saturating_sub(1))
+                            .unwrap_or(0);
+                        popup.col_offset = cmp::min(popup.col_offset + 1, max_cols);
+                    } else {
+                        popup.cursor =
+                            cmp::min(popup.cursor + 1, popup.input.chars().count());
+                    }
+                }
+            }
+            KeyCode::Up => {
+                if let Some(popup) = self.sql_popup.as_mut() {
+                    popup.result_scroll = popup.result_scroll.saturating_sub(1);
+                }
+            }
+            KeyCode::Down => {
+                if let Some(popup) = self.sql_popup.as_mut() {
+                    if let Some(result) = &popup.result {
+                        let max = result.rows.len().saturating_sub(1);
+                        popup.result_scroll = cmp::min(popup.result_scroll + 1, max);
+                    }
+                }
+            }
+            KeyCode::PageUp => {
+                if let Some(popup) = self.sql_popup.as_mut() {
+                    popup.result_scroll = popup.result_scroll.saturating_sub(20);
+                }
+            }
+            KeyCode::PageDown => {
+                if let Some(popup) = self.sql_popup.as_mut() {
+                    if let Some(result) = &popup.result {
+                        let max = result.rows.len().saturating_sub(1);
+                        popup.result_scroll = cmp::min(popup.result_scroll + 20, max);
+                    }
+                }
+            }
+            KeyCode::Home => {
+                if let Some(popup) = self.sql_popup.as_mut() {
+                    popup.cursor = 0;
+                }
+            }
+            KeyCode::End => {
+                if let Some(popup) = self.sql_popup.as_mut() {
+                    popup.cursor = popup.input.chars().count();
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(popup) = self.sql_popup.as_mut() {
+                    if popup.cursor > 0 {
+                        let mut chars: Vec<char> = popup.input.chars().collect();
+                        chars.remove(popup.cursor - 1);
+                        popup.input = chars.into_iter().collect();
+                        popup.cursor -= 1;
+                    }
+                }
+            }
+            KeyCode::Delete => {
+                if let Some(popup) = self.sql_popup.as_mut() {
+                    let len = popup.input.chars().count();
+                    if popup.cursor < len {
+                        let mut chars: Vec<char> = popup.input.chars().collect();
+                        chars.remove(popup.cursor);
+                        popup.input = chars.into_iter().collect();
+                    }
+                }
+            }
+            KeyCode::Char(c) => {
+                if let Some(popup) = self.sql_popup.as_mut() {
+                    let mut chars: Vec<char> = popup.input.chars().collect();
+                    chars.insert(popup.cursor, c);
+                    popup.input = chars.into_iter().collect();
+                    popup.cursor += 1;
+                }
+            }
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    // ------------------------------------------------------------------
     // Info popup (Keybindings / About)
     // ------------------------------------------------------------------
 
@@ -2345,6 +2517,7 @@ impl App {
                 "  o                Sort by current column (asc/desc/none)".to_string(),
                 "  Click header     Sort by clicked column".to_string(),
                 "  /                Search in loaded data".to_string(),
+                "  Ctrl+D           SQL query (DuckDB)".to_string(),
                 String::new(),
                 "Info Tabs".to_string(),
                 "  1 / click        Schema".to_string(),
@@ -2377,12 +2550,13 @@ impl App {
                 String::new(),
                 "A terminal-based Parquet & CSV data explorer.".to_string(),
                 String::new(),
-                "Built with Rust, Ratatui, and Polars.".to_string(),
+                "Built with Rust, Ratatui, Polars, and DuckDB.".to_string(),
                 String::new(),
                 "Features:".to_string(),
                 "  - Browse and inspect Parquet and CSV files".to_string(),
                 "  - View schema, statistics, and metadata".to_string(),
                 "  - Column sorting and row search".to_string(),
+                "  - SQL queries via DuckDB".to_string(),
                 "  - Import CSV → Parquet / Export Parquet → CSV".to_string(),
                 "  - File operations (rename, copy, move, delete)".to_string(),
                 "  - Multiple color themes with persistence".to_string(),
