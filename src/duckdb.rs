@@ -36,32 +36,33 @@ pub fn run_sql(file_path: &Path, query: &str) -> anyhow::Result<SqlResult> {
 
     let mut stmt = conn
         .prepare(query)
-        .with_context(|| format!("SQL error: failed to prepare query"))?;
+        .with_context(|| "SQL error: failed to prepare query")?;
 
-    let col_count = stmt.column_count();
-    let column_names: Vec<String> = (0..col_count)
-        .map(|i| stmt.column_name(i).map_or("?", |v| v).to_string())
-        .collect();
-
-    let rows_iter = stmt
-        .query_map([], |row| {
-            let mut cells = Vec::with_capacity(col_count);
-            for i in 0..col_count {
-                let val: String = row
-                    .get::<_, duckdb::types::Value>(i)
-                    .map(|v| format_duckdb_value(&v))
-                    .unwrap_or_else(|_| "NULL".to_string());
-                cells.push(val);
-            }
-            Ok(cells)
-        })
+    let mut result_rows = stmt
+        .query([])
         .with_context(|| "SQL error: failed to execute query")?;
+
+    // Get column info from the underlying statement via Rows::as_ref()
+    let (col_count, column_names) = match result_rows.as_ref() {
+        Some(s) => (s.column_count(), s.column_names()),
+        None => (0, Vec::new()),
+    };
 
     let mut rows = Vec::new();
     let mut capped = false;
-    for row_result in rows_iter {
-        let row = row_result.with_context(|| "failed to read row")?;
-        rows.push(row);
+    while let Some(row) = result_rows
+        .next()
+        .with_context(|| "failed to read row")?
+    {
+        let mut cells = Vec::with_capacity(col_count);
+        for i in 0..col_count {
+            let val: String = row
+                .get::<_, duckdb::types::Value>(i)
+                .map(|v| format_duckdb_value(&v))
+                .unwrap_or_else(|_| "NULL".to_string());
+            cells.push(val);
+        }
+        rows.push(cells);
         if rows.len() >= MAX_SQL_ROWS {
             capped = true;
             break;
