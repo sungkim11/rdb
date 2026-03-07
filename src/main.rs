@@ -1,0 +1,202 @@
+use std::env;
+use std::io;
+use std::time::Duration;
+
+use anyhow::Context;
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+};
+use crossterm::execute;
+use crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode, size,
+};
+use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
+
+mod app;
+mod parquet;
+mod theme;
+mod ui;
+
+use app::{ActivePane, App, FileActionKind};
+
+fn main() -> anyhow::Result<()> {
+    let root = env::current_dir().context("failed to read current directory")?;
+    let mut app = App::new(root)?;
+
+    enable_raw_mode().context("failed to enable raw mode")?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)
+        .context("failed to enter alternate screen")?;
+
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend).context("failed to create terminal")?;
+
+    let run_result = run_app(&mut terminal, &mut app);
+
+    disable_raw_mode().context("failed to disable raw mode")?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )
+    .context("failed to restore terminal screen")?;
+    terminal.show_cursor().context("failed to show cursor")?;
+
+    run_result
+}
+
+fn run_app(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut App,
+) -> anyhow::Result<()> {
+    loop {
+        terminal.draw(|frame| ui::draw(frame, app))?;
+
+        if !event::poll(Duration::from_millis(200))? {
+            continue;
+        }
+
+        match event::read()? {
+            Event::Key(key) => {
+                if key.kind == KeyEventKind::Release {
+                    continue;
+                }
+
+                if app.palette_popup.is_some() {
+                    app.handle_palette_key(key);
+                    continue;
+                }
+
+                if app.file_menu_open && app.handle_file_menu_key(key) {
+                    if app.consume_quit_requested() {
+                        break;
+                    }
+                    continue;
+                }
+
+                if app.file_action_popup.is_some() {
+                    app.handle_file_action_key(key)?;
+                    continue;
+                }
+
+                if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('q') {
+                    break;
+                }
+
+                if (key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('p'))
+                    || (key.modifiers.contains(KeyModifiers::ALT) && key.code == KeyCode::Char('t'))
+                {
+                    app.open_palette_popup();
+                    continue;
+                }
+
+                match key.code {
+                    KeyCode::Char('q') => break,
+                    KeyCode::Char('r') => {
+                        let result = app.rescan_files();
+                        app.apply_result(result);
+                    }
+                    KeyCode::Tab => app.toggle_focus(),
+                    KeyCode::Enter => {
+                        if app.active_pane == ActivePane::Files {
+                            let result = app.load_selected();
+                            app.apply_result(result);
+                        }
+                    }
+                    KeyCode::Up => match app.active_pane {
+                        ActivePane::Files => app.move_selection(-1),
+                        ActivePane::Preview => {
+                            let result = app.scroll_preview_rows(-1);
+                            app.apply_result(result);
+                        }
+                    },
+                    KeyCode::Down => match app.active_pane {
+                        ActivePane::Files => app.move_selection(1),
+                        ActivePane::Preview => {
+                            let result = app.scroll_preview_rows(1);
+                            app.apply_result(result);
+                        }
+                    },
+                    KeyCode::PageUp => {
+                        if app.active_pane == ActivePane::Preview {
+                            let result = app.page_preview_rows(-1);
+                            app.apply_result(result);
+                        }
+                    }
+                    KeyCode::PageDown => {
+                        if app.active_pane == ActivePane::Preview {
+                            let result = app.page_preview_rows(1);
+                            app.apply_result(result);
+                        }
+                    }
+                    KeyCode::Left => match app.active_pane {
+                        ActivePane::Preview => {
+                            let step = if key.modifiers.contains(KeyModifiers::CONTROL) {
+                                -5
+                            } else {
+                                -1
+                            };
+                            let result = app.scroll_preview_cols(step);
+                            app.apply_result(result);
+                        }
+                        ActivePane::Files => app.collapse_selected_directory_or_parent(),
+                    },
+                    KeyCode::Right => match app.active_pane {
+                        ActivePane::Preview => {
+                            let step = if key.modifiers.contains(KeyModifiers::CONTROL) {
+                                5
+                            } else {
+                                1
+                            };
+                            let result = app.scroll_preview_cols(step);
+                            app.apply_result(result);
+                        }
+                        ActivePane::Files => app.expand_selected_directory(),
+                    },
+                    KeyCode::Backspace => {
+                        if app.active_pane == ActivePane::Files {
+                            app.collapse_selected_directory_or_parent();
+                        }
+                    }
+                    KeyCode::Char('n') => {
+                        if app.active_pane == ActivePane::Files {
+                            app.open_file_action(FileActionKind::Rename);
+                        }
+                    }
+                    KeyCode::Char('c') => {
+                        if app.active_pane == ActivePane::Files {
+                            app.open_file_action(FileActionKind::Copy);
+                        }
+                    }
+                    KeyCode::Char('m') => {
+                        if app.active_pane == ActivePane::Files {
+                            app.open_file_action(FileActionKind::Move);
+                        }
+                    }
+                    KeyCode::Char('d') => {
+                        if app.active_pane == ActivePane::Files {
+                            let result = app.arm_or_delete_selected();
+                            app.apply_result(result);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Event::Mouse(mouse) => {
+                let (cols, rows) = size()?;
+                let result = app.handle_mouse_event(mouse, cols, rows);
+                app.apply_result(result);
+            }
+            _ => {
+                continue;
+            }
+        }
+
+        if app.consume_quit_requested() {
+            break;
+        }
+    }
+
+    Ok(())
+}

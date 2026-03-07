@@ -1,0 +1,11 @@
+[package]
+name = "rdb"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0"
+crossterm = "0.29"
+polars = { version = "0.51", default-features = false, features = ["parquet", "fmt"] }
+ratatui = "0.29"
+walkdir = "2.5"
