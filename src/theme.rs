@@ -55,6 +55,27 @@ impl PaletteTheme {
         Self::ALL[index % Self::ALL.len()]
     }
 
+    pub fn settings_value(self) -> &'static str {
+        match self {
+            PaletteTheme::MainframeGreen => "mainframe_green",
+            PaletteTheme::BlackWhite => "black_white",
+            PaletteTheme::Amber => "amber",
+            PaletteTheme::OceanBlue => "ocean_blue",
+            PaletteTheme::LightPaper => "light_paper",
+        }
+    }
+
+    pub fn from_settings_value(value: &str) -> Option<Self> {
+        match value {
+            "mainframe_green" => Some(PaletteTheme::MainframeGreen),
+            "black_white" => Some(PaletteTheme::BlackWhite),
+            "amber" => Some(PaletteTheme::Amber),
+            "ocean_blue" => Some(PaletteTheme::OceanBlue),
+            "light_paper" => Some(PaletteTheme::LightPaper),
+            _ => None,
+        }
+    }
+
     pub fn theme(self) -> Theme {
         match self {
             PaletteTheme::MainframeGreen => Theme {
