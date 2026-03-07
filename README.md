@@ -21,7 +21,7 @@ It provides a multi-pane TUI with a file explorer, Parquet/CSV data preview with
   - Prettified popup views
 - Search:
   - `Tools | Search` popup for searching within loaded data
-- File operations:
+- File operations (via menu):
   - Rename, copy, move
   - Delete (double-press confirm)
 - Import/export:
@@ -129,31 +129,44 @@ Settings (palette, recent files) are stored in:
 
 ## Keybindings
 
-- `F1`: Help keybindings popup
-- `Tab`: switch focused pane
-- `Ctrl-Q`: quit
-- `Ctrl-P` / `Alt-T`: open palette
-- `Ctrl-I`: import CSV to Parquet
-- `Ctrl-E`: export Parquet to CSV
-- `/`: search within loaded data
-- `o`: toggle sort on current column (Preview pane)
-- `i`: show Metadata info tab
-- `s`: show Statistics info tab
-- `1` / `2` / `3`: switch to Schema / Statistics / Metadata tab
-- `r`: rescan explorer tree
-- `n`: rename selected file
-- `c`: copy selected file
-- `m`: move selected file
-- `d`: delete selected file (press twice within 3s)
-
 Navigation:
 
-- `Up/Down`: file selection (Files pane) or row scroll (Preview pane)
-- `Left/Right`: column scroll (Preview pane) or collapse/expand (Files pane)
-- `Ctrl-Left/Right`: faster column scroll
-- `PageUp/PageDown`: page row scroll in Preview pane
-- `Enter`: load selected file or expand/collapse directory
-- `Backspace`: collapse directory or go to parent (Files pane)
+- `Tab`: switch pane (Files / Preview)
+- `Up/Down`: move selection / scroll rows
+- `Left/Right`: collapse/expand dir · scroll columns
+- `Ctrl+Left/Right`: scroll columns by 5
+- `PageUp/PageDown`: page through rows
+- `Shift+Up/Down`: scroll info panel
+- `Enter`: open/toggle selected entry
+- `Backspace`: collapse directory or go to parent
+
+Data:
+
+- `o`: sort by current column (asc/desc/none)
+- Click header: sort by clicked column
+- `/`: search in loaded data
+
+Info tabs:
+
+- `1` / click: Schema
+- `2` / `s` / click: Statistics
+- `3` / `i` / click: Metadata
+
+File:
+
+- `Ctrl+I`: import CSV → Parquet
+- `Ctrl+E`: export Parquet → CSV
+- `r`: refresh file list
+
+Tools:
+
+- `Ctrl+P` / `Alt+T`: open palette
+
+General:
+
+- `F1`: keybindings help
+- `Ctrl+Q`: quit
+- `Esc`: close popup / menu
 
 Menu navigation:
 
