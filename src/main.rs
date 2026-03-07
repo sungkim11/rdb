@@ -21,8 +21,15 @@ mod ui;
 use app::{ActivePane, App, FileActionKind};
 
 fn main() -> anyhow::Result<()> {
+    let args: Vec<String> = env::args().collect();
     let root = env::current_dir().context("failed to read current directory")?;
     let mut app = App::new(root)?;
+
+    if let Some(file_arg) = args.get(1) {
+        let path = std::path::Path::new(file_arg);
+        let result = app.open_file(path);
+        app.apply_result(result);
+    }
 
     enable_raw_mode().context("failed to enable raw mode")?;
     let mut stdout = io::stdout();
