@@ -151,7 +151,6 @@ pub struct SavedConnection {
     pub host: String,
     pub port: String,
     pub user: String,
-    pub password: String,
     pub dbname: String,
 }
 
@@ -164,15 +163,76 @@ impl SavedConnection {
         }
     }
 
-    pub fn conn_str(&self) -> String {
-        let mut s = format!(
-            "host={} port={} user={} dbname={}",
-            self.host, self.port, self.user, self.dbname
-        );
-        if !self.password.is_empty() {
-            s.push_str(&format!(" password={}", self.password));
+}
+
+/// Return the path to `~/.pgpass`.
+fn pgpass_path() -> Option<PathBuf> {
+    env::var_os("HOME").map(|h| PathBuf::from(h).join(".pgpass"))
+}
+
+/// Look up a password in `~/.pgpass`.
+/// Format per line: `hostname:port:database:username:password`
+/// `*` is a wildcard that matches anything.
+fn pgpass_lookup(host: &str, port: &str, dbname: &str, user: &str) -> Option<String> {
+    let path = pgpass_path()?;
+    let contents = fs::read_to_string(path).ok()?;
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
         }
-        s
+        let parts: Vec<&str> = line.splitn(5, ':').collect();
+        if parts.len() != 5 {
+            continue;
+        }
+        let matches = |field: &str, value: &str| field == "*" || field == value;
+        if matches(parts[0], host)
+            && matches(parts[1], port)
+            && matches(parts[2], dbname)
+            && matches(parts[3], user)
+        {
+            return Some(parts[4].to_string());
+        }
+    }
+    None
+}
+
+/// Save or update a password entry in `~/.pgpass`.
+/// Sets file permissions to 0600 as required by PostgreSQL.
+fn pgpass_upsert(host: &str, port: &str, dbname: &str, user: &str, password: &str) {
+    let Some(path) = pgpass_path() else { return };
+
+    let mut lines: Vec<String> = fs::read_to_string(&path)
+        .unwrap_or_default()
+        .lines()
+        .map(|l| l.to_string())
+        .collect();
+
+    let matches_entry = |line: &str| -> bool {
+        let parts: Vec<&str> = line.splitn(5, ':').collect();
+        parts.len() == 5
+            && parts[0] == host
+            && parts[1] == port
+            && parts[2] == dbname
+            && parts[3] == user
+    };
+
+    let new_line = format!("{host}:{port}:{dbname}:{user}:{password}");
+
+    if let Some(pos) = lines.iter().position(|l| matches_entry(l)) {
+        lines[pos] = new_line;
+    } else {
+        lines.push(new_line);
+    }
+
+    let content = lines.join("\n") + "\n";
+    let _ = fs::write(&path, content);
+
+    // Set 0600 permissions (owner read/write only)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
     }
 }
 
@@ -2776,7 +2836,7 @@ impl App {
                 PgField::new("Host", conn.map(|c| c.host.as_str()).unwrap_or("127.0.0.1"), false),
                 PgField::new("Port", conn.map(|c| c.port.as_str()).unwrap_or("5432"), false),
                 PgField::new("User", conn.map(|c| c.user.as_str()).unwrap_or("postgres"), false),
-                PgField::new("Password", conn.map(|c| c.password.as_str()).unwrap_or(""), true),
+                PgField::new("Password", conn.and_then(|c| pgpass_lookup(&c.host, &c.port, &c.dbname, &c.user)).as_deref().unwrap_or(""), true),
                 PgField::new("Database", conn.map(|c| c.dbname.as_str()).unwrap_or("postgres"), false),
             ],
             uri: String::new(),
@@ -2979,10 +3039,17 @@ impl App {
             host: host.clone(),
             port: port.clone(),
             user: user.clone(),
-            password: password.clone(),
             dbname: dbname.clone(),
         };
-        let conn_str = saved.conn_str();
+
+        // Build connection string with the password from the popup
+        let mut conn_str = format!(
+            "host={} port={} user={} dbname={}",
+            host, port, user, dbname
+        );
+        if !password.is_empty() {
+            conn_str.push_str(&format!(" password={}", password));
+        }
 
         match pg::test_connection(&conn_str) {
             Ok(()) => {
@@ -2991,11 +3058,14 @@ impl App {
                     c.host == host && c.port == port && c.user == user && c.dbname == dbname
                 }) {
                     existing.name = name;
-                    existing.password = password;
                 } else {
                     self.saved_connections.push(saved);
                 }
                 let _ = self.save_connections();
+                // Store password in ~/.pgpass
+                if !password.is_empty() {
+                    pgpass_upsert(&host, &port, &dbname, &user, &password);
+                }
 
                 // Fetch database tree
                 match pg::fetch_db_tree(&conn_str) {
@@ -3595,7 +3665,6 @@ impl App {
                     host: obj.get("host")?.as_str()?.to_string(),
                     port: obj.get("port")?.as_str().unwrap_or("5432").to_string(),
                     user: obj.get("user")?.as_str()?.to_string(),
-                    password: obj.get("password").and_then(|v| v.as_str()).unwrap_or("").to_string(),
                     dbname: obj.get("dbname")?.as_str()?.to_string(),
                 })
             })
@@ -3618,7 +3687,6 @@ impl App {
                     "host": c.host,
                     "port": c.port,
                     "user": c.user,
-                    "password": c.password,
                     "dbname": c.dbname,
                 })
             })
